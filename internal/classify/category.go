@@ -139,7 +139,16 @@ func (c *CategoryManager) SeedDefaultCategories(ctx context.Context) error {
 	}
 
 	if count > 0 {
-		return nil // Already seeded
+		// Already seeded — but make sure Notifications exists (added after
+		// original seed; needed to route non-auth noreply@ away from Auth).
+		existing, err := c.GetCategory(ctx, "Notifications")
+		if err == nil && existing == nil {
+			_ = c.AddCategory(ctx, "Notifications",
+				"Non-auth noreply/system notifications that should stay in the inbox for quick review",
+				"Briefly summarize what this notification is about and whether any action is needed.",
+				true, "low")
+		}
+		return nil
 	}
 
 	// Default categories with descriptions and summarization prompts
@@ -226,6 +235,13 @@ func (c *CategoryManager) SeedDefaultCategories(ctx context.Context) error {
 			summarizationPrompt: "If there are questions or action items, start with 'ACTION NEEDED:'. Summarize: what it's about, any questions to answer, and what I should do.",
 			keepInInbox:         false,
 			priorityDefault:     "medium",
+		},
+		{
+			name:                "Notifications",
+			description:         "Non-auth noreply/system notifications that should stay in the inbox for quick review",
+			summarizationPrompt: "Briefly summarize what this notification is about and whether any action is needed.",
+			keepInInbox:         true,
+			priorityDefault:     "low",
 		},
 	}
 

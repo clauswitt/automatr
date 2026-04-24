@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/clauswitt/automatr/internal/classify"
@@ -403,6 +405,172 @@ func (d *DigestService) ArchiveDigestEmails(ctx context.Context, digest *DigestS
 	}
 
 	return archivedCount, nil
+}
+
+// summaryFilePath returns the companion summary file path for a digest output.
+// e.g. "/tmp/digest.md" -> "/tmp/digest.summary.md".
+// If the input has no ".md" suffix, ".summary.md" is appended verbatim.
+func summaryFilePath(digestPath string) string {
+	if strings.HasSuffix(digestPath, ".md") {
+		return strings.TrimSuffix(digestPath, ".md") + ".summary.md"
+	}
+	return digestPath + ".summary.md"
+}
+
+// SummaryFilePath exposes summaryFilePath for callers who want to preview
+// where the companion file will be written.
+func SummaryFilePath(digestPath string) string {
+	return summaryFilePath(digestPath)
+}
+
+// WriteSummaryFile writes a machine-readable companion file alongside the
+// main digest output. The digest (with its Categories populated) is bucketed
+// into "Needs Attention" / "People & Clients" / "Archived" / "Stats" using
+// per-message priority inferred from category + extracted metadata.
+func (d *DigestService) WriteSummaryFile(ctx context.Context, digest *DigestSummary, digestPath string) error {
+	if digestPath == "" {
+		return nil
+	}
+	path := summaryFilePath(digestPath)
+
+	// Pre-fetch category metadata so we know which categories are archived
+	// (KeepInInbox=false) and can infer per-message priority.
+	catMgr := d.classifier.GetCategoryManager()
+	categoryMeta := make(map[string]*classify.Category)
+	for category := range digest.Categories {
+		cat, err := catMgr.GetCategory(ctx, category)
+		if err == nil && cat != nil {
+			categoryMeta[category] = cat
+		}
+	}
+
+	type scored struct {
+		email    EmailSummary
+		priority string
+	}
+
+	var needsAttention []scored
+	var peopleClients []scored
+	archivedCounts := make(map[string]int)
+	needsReview := 0
+	archivedTotal := 0
+	inboxRemaining := 0
+	totalProcessed := 0
+
+	for category, emails := range digest.Categories {
+		cat := categoryMeta[category]
+		isArchived := cat != nil && !cat.KeepInInbox
+
+		for _, email := range emails {
+			totalProcessed++
+			if isArchived {
+				archivedCounts[category]++
+				archivedTotal++
+			} else {
+				inboxRemaining++
+			}
+			if category == "Needs Review" {
+				needsReview++
+			}
+
+			metadata := classify.ExtractMetadata(email.Subject, "")
+			priority := classify.InferPriority(category, metadata)
+
+			s := scored{email: email, priority: priority}
+
+			switch category {
+			case "People", "Clients":
+				if priority == "urgent" || priority == "high" {
+					needsAttention = append(needsAttention, s)
+				} else {
+					peopleClients = append(peopleClients, s)
+				}
+			case "Projects":
+				if priority == "urgent" || priority == "high" {
+					needsAttention = append(needsAttention, s)
+				}
+			case "Finance":
+				// Finance receipts land at priority "low" (has amount, no change).
+				// Anything urgent/high (overdue, cost increase) is attention-worthy.
+				if priority == "urgent" || priority == "high" {
+					needsAttention = append(needsAttention, s)
+				}
+			}
+		}
+	}
+
+	// Sort each bucket by received time (newest first) for stable output.
+	sort.Slice(needsAttention, func(i, j int) bool {
+		return needsAttention[i].email.ReceivedAt.After(needsAttention[j].email.ReceivedAt)
+	})
+	sort.Slice(peopleClients, func(i, j int) bool {
+		return peopleClients[i].email.ReceivedAt.After(peopleClients[j].email.ReceivedAt)
+	})
+
+	var b strings.Builder
+	b.WriteString("---\n")
+	b.WriteString(fmt.Sprintf("date: %s\n", digest.EndTime.Format("2006-01-02")))
+	b.WriteString(fmt.Sprintf("window: %s-%s\n",
+		digest.StartTime.Format("15:04"),
+		digest.EndTime.Format("15:04")))
+	b.WriteString("---\n\n")
+
+	b.WriteString("## 🔴 Needs Attention\n")
+	if len(needsAttention) == 0 {
+		b.WriteString("_None_\n")
+	} else {
+		for _, s := range needsAttention {
+			b.WriteString(formatSummaryLine(s.email))
+		}
+	}
+	b.WriteString("\n")
+
+	b.WriteString("## 👤 People & Clients\n")
+	if len(peopleClients) == 0 {
+		b.WriteString("_None_\n")
+	} else {
+		for _, s := range peopleClients {
+			b.WriteString(formatSummaryLine(s.email))
+		}
+	}
+	b.WriteString("\n")
+
+	b.WriteString("## 🗃 Archived\n")
+	if len(archivedCounts) == 0 {
+		b.WriteString("_None_\n")
+	} else {
+		// Deterministic order by category name.
+		cats := make([]string, 0, len(archivedCounts))
+		for c := range archivedCounts {
+			cats = append(cats, c)
+		}
+		sort.Strings(cats)
+		parts := make([]string, 0, len(cats))
+		for _, c := range cats {
+			parts = append(parts, fmt.Sprintf("%s: %d", c, archivedCounts[c]))
+		}
+		b.WriteString(strings.Join(parts, " | "))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+
+	b.WriteString("## 📊 Stats\n")
+	b.WriteString(fmt.Sprintf("Total processed: %d | Archived: %d | Inbox remaining: %d | Needs review: %d\n",
+		totalProcessed, archivedTotal, inboxRemaining, needsReview))
+
+	return os.WriteFile(path, []byte(b.String()), 0644)
+}
+
+// formatSummaryLine renders one email as a single-bullet line for the
+// summary file: "- **From**: ... | **Subject**: ... | [Open](...)".
+func formatSummaryLine(email EmailSummary) string {
+	from := email.From
+	subject := strings.TrimSpace(email.Subject)
+	if subject == "" {
+		subject = "(no subject)"
+	}
+	return fmt.Sprintf("- **From**: %s | **Subject**: %s | **ID**: %s | [Open](%s)\n",
+		from, subject, email.MessageID, email.WebLink)
 }
 
 func contains(s, substr string) bool {

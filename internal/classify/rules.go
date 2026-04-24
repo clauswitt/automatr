@@ -58,20 +58,57 @@ func buildRules() []Rule {
 			},
 		},
 
-		// Auth / Security
+		// Auth / Security — security@ / 2fa@ senders are reliably auth
 		{
 			Name:       "Security/Auth sender patterns",
 			Category:   "Auth",
 			Confidence: 0.9,
 			Check: func(email EmailInput) bool {
 				lower := strings.ToLower(email.From)
-				patterns := []string{"security@", "2fa@", "noreply@", "no-reply@"}
+				patterns := []string{"security@", "2fa@"}
 				for _, p := range patterns {
 					if strings.Contains(lower, p) {
 						return true
 					}
 				}
 				return false
+			},
+		},
+		// noreply@ senders: only treat as Auth if the subject also looks
+		// auth-related. Plenty of noreply@ traffic is receipts/notifications
+		// that should NOT be auto-archived as Auth.
+		{
+			Name:       "noreply-auth",
+			Category:   "Auth",
+			Confidence: 0.92,
+			Check: func(email EmailInput) bool {
+				from := strings.ToLower(email.From)
+				if !strings.Contains(from, "noreply@") && !strings.Contains(from, "no-reply@") {
+					return false
+				}
+				subj := strings.ToLower(email.Subject)
+				authKeywords := []string{
+					"code", "otp", "verify", "verification",
+					"login", "sign in", "2fa",
+					"authentication", "password reset", "security code",
+				}
+				for _, kw := range authKeywords {
+					if strings.Contains(subj, kw) {
+						return true
+					}
+				}
+				return false
+			},
+		},
+		// Generic noreply@ senders that aren't auth — route to Notifications
+		// (a KeepInInbox=true category) so they don't get auto-archived.
+		{
+			Name:       "noreply-generic",
+			Category:   "Notifications",
+			Confidence: 0.75,
+			Check: func(email EmailInput) bool {
+				from := strings.ToLower(email.From)
+				return strings.Contains(from, "noreply@") || strings.Contains(from, "no-reply@")
 			},
 		},
 		{
@@ -148,7 +185,7 @@ func buildRules() []Rule {
 			Confidence: 0.92,
 			Check: func(email EmailInput) bool {
 				lower := strings.ToLower(email.From)
-				patterns := []string{"alert@", "alerts@", "monitoring@", "noreply@", "notifications@"}
+				patterns := []string{"alert@", "alerts@", "monitoring@", "notifications@"}
 				for _, p := range patterns {
 					if strings.Contains(lower, p) {
 						return true

@@ -49,6 +49,7 @@ func main() {
 		syncTimespan   = flag.String("sync-timespan", "48h", "Timespan to sync (e.g., 24h, 48h, 7d, 2w)")
 		syncOutput     = flag.String("sync-output", "", "Output file for digest (stdout if empty)")
 		syncNoSummary  = flag.Bool("sync-no-summary", false, "Skip AI summary generation (faster, just show subject lines)")
+		dryRunLog      = flag.String("dry-run-log", "", "If set, do NOT archive — append [WOULD-ARCHIVE] lines to this file instead")
 	)
 	flag.Parse()
 
@@ -90,7 +91,7 @@ func main() {
 	// Handle commands
 	switch {
 	case *syncCmd:
-		if err := syncEmails(ctx, cfg, client, db, *syncTimespan, *syncOutput, *syncNoSummary); err != nil {
+		if err := syncEmails(ctx, cfg, client, db, *syncTimespan, *syncOutput, *syncNoSummary, *dryRunLog); err != nil {
 			log.Fatalf("Failed to sync emails: %v", err)
 		}
 	case *migrateLinks:
@@ -239,12 +240,9 @@ func readEmail(ctx context.Context, client *graph.Client, messageID string) erro
 func initializeEmbeddings(ctx context.Context, cfg *Config, db *store.Store) error {
 	fmt.Println("Initializing category embeddings...")
 
-	// Create LLM provider for embeddings
-	var provider classify.LLMProvider
-	if cfg.AI.EmbeddingsProvider == "openai" {
-		provider = classify.NewOpenAIProvider(cfg.AI.OpenAI.APIKey, cfg.AI.OpenAI.Model)
-	} else {
-		return fmt.Errorf("only openai supported for embeddings")
+	provider, err := buildEmbeddingsProvider(cfg)
+	if err != nil {
+		return err
 	}
 
 	// Create classifier and initialize
@@ -258,14 +256,9 @@ func initializeEmbeddings(ctx context.Context, cfg *Config, db *store.Store) err
 }
 
 func runDaemon(ctx context.Context, cfg *Config, client *graph.Client, db *store.Store, port int, autoStop, background bool) error {
-	// Create LLM provider
-	var provider classify.LLMProvider
-	if cfg.AI.Provider == "openai" {
-		provider = classify.NewOpenAIProvider(cfg.AI.OpenAI.APIKey, cfg.AI.OpenAI.Model)
-	} else if cfg.AI.Provider == "anthropic" {
-		provider = classify.NewAnthropicProvider(cfg.AI.Anthropic.APIKey, cfg.AI.Anthropic.Model)
-	} else {
-		return fmt.Errorf("unknown AI provider: %s", cfg.AI.Provider)
+	provider, err := buildLLMProvider(cfg)
+	if err != nil {
+		return err
 	}
 
 	// Create classifier
@@ -305,14 +298,9 @@ func runDaemon(ctx context.Context, cfg *Config, client *graph.Client, db *store
 }
 
 func createDigest(ctx context.Context, cfg *Config, client *graph.Client, db *store.Store, timespan, outputFile string) error {
-	// Create LLM provider
-	var provider classify.LLMProvider
-	if cfg.AI.Provider == "openai" {
-		provider = classify.NewOpenAIProvider(cfg.AI.OpenAI.APIKey, cfg.AI.OpenAI.Model)
-	} else if cfg.AI.Provider == "anthropic" {
-		provider = classify.NewAnthropicProvider(cfg.AI.Anthropic.APIKey, cfg.AI.Anthropic.Model)
-	} else {
-		return fmt.Errorf("unknown AI provider: %s", cfg.AI.Provider)
+	provider, err := buildLLMProvider(cfg)
+	if err != nil {
+		return err
 	}
 
 	// Create classifier
@@ -401,6 +389,11 @@ func createDigest(ctx context.Context, cfg *Config, client *graph.Client, db *st
 			return fmt.Errorf("failed to write to file: %w", err)
 		}
 		fmt.Printf("✓ Digest saved to %s\n", outputFile)
+		if err := digestSvc.WriteSummaryFile(ctx, digest, outputFile); err != nil {
+			fmt.Printf("⚠️  Failed to write summary companion: %v\n", err)
+		} else {
+			fmt.Printf("✓ Summary companion saved to %s\n", summarize.SummaryFilePath(outputFile))
+		}
 	} else {
 		fmt.Print(output)
 	}
@@ -492,14 +485,9 @@ func classifyEmail(ctx context.Context, cfg *Config, client *graph.Client, db *s
 	fmt.Printf("Subject: %s\n", msg.Subject)
 	fmt.Printf("From: %s <%s>\n\n", msg.From.EmailAddress.Name, msg.From.EmailAddress.Address)
 
-	// Create LLM provider based on config
-	var provider classify.LLMProvider
-	if cfg.AI.Provider == "openai" {
-		provider = classify.NewOpenAIProvider(cfg.AI.OpenAI.APIKey, cfg.AI.OpenAI.Model)
-	} else if cfg.AI.Provider == "anthropic" {
-		provider = classify.NewAnthropicProvider(cfg.AI.Anthropic.APIKey, cfg.AI.Anthropic.Model)
-	} else {
-		return fmt.Errorf("unknown AI provider: %s", cfg.AI.Provider)
+	provider, err := buildLLMProvider(cfg)
+	if err != nil {
+		return err
 	}
 
 	// Create classifier (dry-run mode)
@@ -555,7 +543,7 @@ type Config struct {
 }
 
 type AIConfig struct {
-	// Primary provider for LLM adjudication (openai or anthropic)
+	// Primary provider for LLM adjudication (ollama, openai, or anthropic)
 	Provider string `yaml:"provider"`
 
 	// OpenAI configuration
@@ -564,7 +552,10 @@ type AIConfig struct {
 	// Anthropic configuration
 	Anthropic AnthropicConfig `yaml:"anthropic"`
 
-	// Embeddings provider (openai only for now)
+	// Ollama configuration
+	Ollama OllamaConfig `yaml:"ollama"`
+
+	// Embeddings provider (ollama or openai)
 	EmbeddingsProvider string `yaml:"embeddings_provider"`
 }
 
@@ -576,6 +567,51 @@ type OpenAIConfig struct {
 type AnthropicConfig struct {
 	APIKey string `yaml:"api_key"`
 	Model  string `yaml:"model"` // e.g., "claude-3-5-haiku-20241022"
+}
+
+type OllamaConfig struct {
+	BaseURL    string `yaml:"base_url"`    // e.g., "http://localhost:11434"
+	Model      string `yaml:"model"`       // e.g., "qwen2.5:7b"
+	EmbedModel string `yaml:"embed_model"` // e.g., "nomic-embed-text"
+}
+
+// buildLLMProvider constructs the primary LLM provider for classification/summarization.
+// When the primary is ollama and an OpenAI key is present, the result is wrapped
+// in a FallbackProvider so callers transparently survive a local Ollama outage.
+func buildLLMProvider(cfg *Config) (classify.LLMProvider, error) {
+	switch cfg.AI.Provider {
+	case "ollama":
+		primary := classify.NewOllamaProvider(cfg.AI.Ollama.BaseURL, cfg.AI.Ollama.Model, cfg.AI.Ollama.EmbedModel)
+		if cfg.AI.OpenAI.APIKey != "" {
+			secondary := classify.NewOpenAIProvider(cfg.AI.OpenAI.APIKey, cfg.AI.OpenAI.Model)
+			return classify.NewFallbackProvider(primary, secondary), nil
+		}
+		return primary, nil
+	case "openai":
+		return classify.NewOpenAIProvider(cfg.AI.OpenAI.APIKey, cfg.AI.OpenAI.Model), nil
+	case "anthropic":
+		return classify.NewAnthropicProvider(cfg.AI.Anthropic.APIKey, cfg.AI.Anthropic.Model), nil
+	default:
+		return nil, fmt.Errorf("unknown AI provider: %s", cfg.AI.Provider)
+	}
+}
+
+// buildEmbeddingsProvider constructs the provider used for generating embeddings.
+// Anthropic doesn't support embeddings, so we only accept ollama or openai here.
+func buildEmbeddingsProvider(cfg *Config) (classify.LLMProvider, error) {
+	switch cfg.AI.EmbeddingsProvider {
+	case "ollama":
+		primary := classify.NewOllamaProvider(cfg.AI.Ollama.BaseURL, cfg.AI.Ollama.Model, cfg.AI.Ollama.EmbedModel)
+		if cfg.AI.OpenAI.APIKey != "" {
+			secondary := classify.NewOpenAIProvider(cfg.AI.OpenAI.APIKey, cfg.AI.OpenAI.Model)
+			return classify.NewFallbackProvider(primary, secondary), nil
+		}
+		return primary, nil
+	case "openai":
+		return classify.NewOpenAIProvider(cfg.AI.OpenAI.APIKey, cfg.AI.OpenAI.Model), nil
+	default:
+		return nil, fmt.Errorf("unknown embeddings provider: %s", cfg.AI.EmbeddingsProvider)
+	}
 }
 
 func parseTimespan(timespan string) (time.Duration, error) {
@@ -642,6 +678,15 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.AI.Anthropic.Model == "" {
 		cfg.AI.Anthropic.Model = "claude-3-5-haiku-20241022"
 	}
+	if cfg.AI.Ollama.BaseURL == "" {
+		cfg.AI.Ollama.BaseURL = "http://localhost:11434"
+	}
+	if cfg.AI.Ollama.Model == "" {
+		cfg.AI.Ollama.Model = "qwen2.5:7b"
+	}
+	if cfg.AI.Ollama.EmbedModel == "" {
+		cfg.AI.Ollama.EmbedModel = "nomic-embed-text"
+	}
 
 	return &cfg, nil
 }
@@ -649,14 +694,9 @@ func loadConfig(path string) (*Config, error) {
 func processPendingFeedback(ctx context.Context, cfg *Config, db *store.Store) error {
 	fmt.Println("Processing pending user feedback...")
 
-	// Create LLM provider
-	var provider classify.LLMProvider
-	if cfg.AI.Provider == "openai" {
-		provider = classify.NewOpenAIProvider(cfg.AI.OpenAI.APIKey, cfg.AI.OpenAI.Model)
-	} else if cfg.AI.Provider == "anthropic" {
-		provider = classify.NewAnthropicProvider(cfg.AI.Anthropic.APIKey, cfg.AI.Anthropic.Model)
-	} else {
-		return fmt.Errorf("unknown AI provider: %s", cfg.AI.Provider)
+	provider, err := buildLLMProvider(cfg)
+	if err != nil {
+		return err
 	}
 
 	// Create classifier
@@ -677,10 +717,53 @@ func processPendingFeedback(ctx context.Context, cfg *Config, db *store.Store) e
 	return nil
 }
 
-func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *store.Store, timespan, outputFile string, noSummary bool) error {
+// dryRunLogger writes WOULD-ARCHIVE lines to a file instead of performing
+// real archive operations. A nil value means "not in dry-run mode".
+type dryRunLogger struct {
+	f     *os.File
+	count int
+}
+
+func newDryRunLogger(path string) (*dryRunLogger, error) {
+	if path == "" {
+		return nil, nil
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open dry-run log %s: %w", path, err)
+	}
+	return &dryRunLogger{f: f}, nil
+}
+
+func (d *dryRunLogger) log(category string, confidence float64, from, subject string) {
+	if d == nil {
+		return
+	}
+	line := fmt.Sprintf("[WOULD-ARCHIVE] %s | %s | %.2f | %s | %s\n",
+		time.Now().Format(time.RFC3339), category, confidence, from, subject)
+	_, _ = d.f.WriteString(line)
+	d.count++
+}
+
+func (d *dryRunLogger) close() {
+	if d != nil && d.f != nil {
+		_ = d.f.Close()
+	}
+}
+
+func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *store.Store, timespan, outputFile string, noSummary bool, dryRunLogPath string) error {
 	duration, err := parseTimespan(timespan)
 	if err != nil {
 		return fmt.Errorf("invalid timespan: %w", err)
+	}
+
+	dryLog, err := newDryRunLogger(dryRunLogPath)
+	if err != nil {
+		return err
+	}
+	defer dryLog.close()
+	if dryLog != nil {
+		fmt.Printf("🧪 Dry-run mode: archive actions will be logged to %s (no messages will be moved)\n", dryRunLogPath)
 	}
 
 	fmt.Printf("🔄 Syncing emails from the last %s...\n\n", duration)
@@ -695,14 +778,9 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 
 	fmt.Printf("   Found %d inbox messages\n", len(messages))
 
-	// Create LLM provider
-	var provider classify.LLMProvider
-	if cfg.AI.Provider == "openai" {
-		provider = classify.NewOpenAIProvider(cfg.AI.OpenAI.APIKey, cfg.AI.OpenAI.Model)
-	} else if cfg.AI.Provider == "anthropic" {
-		provider = classify.NewAnthropicProvider(cfg.AI.Anthropic.APIKey, cfg.AI.Anthropic.Model)
-	} else {
-		return fmt.Errorf("unknown AI provider: %s", cfg.AI.Provider)
+	provider, err := buildLLMProvider(cfg)
+	if err != nil {
+		return err
 	}
 
 	classifier := classify.NewClassifier(provider, db.DB(), false) // NOT dry-run
@@ -724,13 +802,17 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 			// Already exists - check if needs archiving
 			cat, err := classifier.GetCategoryManager().GetCategory(ctx, existingCategory)
 			if err == nil && cat != nil && !cat.KeepInInbox {
-				archiveFolderID, err := client.GetFolder(ctx, "Archive")
-				if err == nil {
-					movedMsg, err := client.MoveMessage(ctx, msg.ID, archiveFolderID)
-					if err == nil && movedMsg != nil {
-						db.DB().ExecContext(ctx, `UPDATE messages SET id = ?, raw_link = ? WHERE id = ?`,
-							movedMsg.ID, movedMsg.WebLink, msg.ID)
-						archivedCount++
+				if dryLog != nil {
+					dryLog.log(existingCategory, 1.0, msg.From.EmailAddress.Address, msg.Subject)
+				} else {
+					archiveFolderID, err := client.GetFolder(ctx, "Archive")
+					if err == nil {
+						movedMsg, err := client.MoveMessage(ctx, msg.ID, archiveFolderID)
+						if err == nil && movedMsg != nil {
+							db.DB().ExecContext(ctx, `UPDATE messages SET id = ?, raw_link = ? WHERE id = ?`,
+								movedMsg.ID, movedMsg.WebLink, msg.ID)
+							archivedCount++
+						}
 					}
 				}
 			}
@@ -771,13 +853,17 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 		// Auto-archive if needed
 		cat, err := classifier.GetCategoryManager().GetCategory(ctx, result.Category)
 		if err == nil && cat != nil && !cat.KeepInInbox {
-			archiveFolderID, err := client.GetFolder(ctx, "Archive")
-			if err == nil {
-				movedMsg, err := client.MoveMessage(ctx, msg.ID, archiveFolderID)
-				if err == nil && movedMsg != nil {
-					db.DB().ExecContext(ctx, `UPDATE messages SET id = ?, raw_link = ? WHERE id = ?`,
-						movedMsg.ID, movedMsg.WebLink, msg.ID)
-					archivedCount++
+			if dryLog != nil {
+				dryLog.log(result.Category, result.Confidence, msg.From.EmailAddress.Address, msg.Subject)
+			} else {
+				archiveFolderID, err := client.GetFolder(ctx, "Archive")
+				if err == nil {
+					movedMsg, err := client.MoveMessage(ctx, msg.ID, archiveFolderID)
+					if err == nil && movedMsg != nil {
+						db.DB().ExecContext(ctx, `UPDATE messages SET id = ?, raw_link = ? WHERE id = ?`,
+							movedMsg.ID, movedMsg.WebLink, msg.ID)
+						archivedCount++
+					}
 				}
 			}
 		}
@@ -930,6 +1016,10 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 		fmt.Print(output)
 	}
 
+	if dryLog != nil {
+		fmt.Printf("\n🧪 Dry-run: %d messages would have been archived (logged to %s)\n", dryLog.count, dryRunLogPath)
+	}
+
 	fmt.Println("\n✅ Sync complete!")
 	return nil
 }
@@ -954,14 +1044,9 @@ func batchReview(ctx context.Context, cfg *Config, client *graph.Client, db *sto
 		return err
 	}
 
-	// Create LLM provider
-	var provider classify.LLMProvider
-	if cfg.AI.Provider == "openai" {
-		provider = classify.NewOpenAIProvider(cfg.AI.OpenAI.APIKey, cfg.AI.OpenAI.Model)
-	} else if cfg.AI.Provider == "anthropic" {
-		provider = classify.NewAnthropicProvider(cfg.AI.Anthropic.APIKey, cfg.AI.Anthropic.Model)
-	} else {
-		return fmt.Errorf("unknown AI provider: %s", cfg.AI.Provider)
+	provider, err := buildLLMProvider(cfg)
+	if err != nil {
+		return err
 	}
 
 	// Create classifier

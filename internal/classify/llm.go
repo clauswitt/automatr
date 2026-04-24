@@ -4,11 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
+
+// ErrOllamaUnavailable is returned when the Ollama server is unreachable.
+// Callers can use errors.Is to detect this and fall back to a secondary provider.
+var ErrOllamaUnavailable = errors.New("ollama unavailable")
 
 // LLMProvider abstracts LLM API calls for classification
 type LLMProvider interface {
@@ -356,6 +365,255 @@ func (p *AnthropicProvider) Summarize(ctx context.Context, email EmailContent, i
 
 func (p *AnthropicProvider) GenerateEmbedding(ctx context.Context, text string) ([]float64, error) {
 	return nil, fmt.Errorf("Anthropic does not support embeddings - use OpenAI for embeddings")
+}
+
+// OllamaProvider implements LLMProvider for a local Ollama server.
+// Chat completions use the OpenAI-compatible endpoint (/v1/chat/completions).
+// Embeddings use Ollama's native /api/embeddings endpoint.
+type OllamaProvider struct {
+	baseURL    string
+	model      string
+	embedModel string
+	client     *http.Client
+}
+
+func NewOllamaProvider(baseURL, model, embedModel string) *OllamaProvider {
+	return &OllamaProvider{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		model:      model,
+		embedModel: embedModel,
+		client:     &http.Client{Timeout: 120 * time.Second},
+	}
+}
+
+// isConnectionError reports whether err looks like a network-level failure
+// talking to Ollama (connection refused, DNS, timeout, etc.), as opposed to
+// a successful HTTP exchange that returned an error status.
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	return false
+}
+
+func (p *OllamaProvider) wrapConnErr(err error) error {
+	if isConnectionError(err) {
+		return fmt.Errorf("%w: %v", ErrOllamaUnavailable, err)
+	}
+	return err
+}
+
+func (p *OllamaProvider) Classify(ctx context.Context, email EmailContent, allowedCategories []string) (*Classification, error) {
+	prompt := buildClassificationPrompt(email, allowedCategories)
+
+	reqBody := map[string]interface{}{
+		"model": p.model,
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are an email classification assistant. Return only valid JSON."},
+			{"role": "user", "content": prompt},
+		},
+		"temperature": 0.3,
+		"response_format": map[string]string{
+			"type": "json_object",
+		},
+	}
+
+	content, err := p.chatCompletion(ctx, reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	var classification Classification
+	if err := json.Unmarshal([]byte(content), &classification); err != nil {
+		// Some local models ignore response_format and wrap JSON in prose/markdown.
+		start := strings.Index(content, "{")
+		end := strings.LastIndex(content, "}")
+		if start >= 0 && end > start {
+			if err := json.Unmarshal([]byte(content[start:end+1]), &classification); err != nil {
+				return nil, fmt.Errorf("failed to parse classification: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to parse classification: %w", err)
+		}
+	}
+
+	return &classification, nil
+}
+
+func (p *OllamaProvider) Summarize(ctx context.Context, email EmailContent, instructions string) (string, error) {
+	prompt := buildSummarizationPrompt(email, instructions)
+
+	reqBody := map[string]interface{}{
+		"model": p.model,
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are an email summarization assistant. Provide concise, actionable summaries."},
+			{"role": "user", "content": prompt},
+		},
+		"temperature": 0.3,
+		"max_tokens":  150,
+	}
+
+	return p.chatCompletion(ctx, reqBody)
+}
+
+func (p *OllamaProvider) chatCompletion(ctx context.Context, reqBody map[string]interface{}) (string, error) {
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	endpoint := p.baseURL + "/v1/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonData))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", p.wrapConnErr(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		// 5xx from the Ollama process itself is effectively "unavailable"
+		if resp.StatusCode >= 500 {
+			return "", fmt.Errorf("%w: Ollama API error %d: %s", ErrOllamaUnavailable, resp.StatusCode, string(body))
+		}
+		return "", fmt.Errorf("Ollama API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if len(result.Choices) == 0 {
+		return "", fmt.Errorf("no response from Ollama")
+	}
+	return result.Choices[0].Message.Content, nil
+}
+
+func (p *OllamaProvider) GenerateEmbedding(ctx context.Context, text string) ([]float64, error) {
+	reqBody := map[string]interface{}{
+		"model":  p.embedModel,
+		"prompt": text,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := p.baseURL + "/api/embeddings"
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, p.wrapConnErr(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 500 {
+			return nil, fmt.Errorf("%w: Ollama embeddings error %d: %s", ErrOllamaUnavailable, resp.StatusCode, string(body))
+		}
+		return nil, fmt.Errorf("Ollama embeddings error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Embedding []float64 `json:"embedding"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	if len(result.Embedding) == 0 {
+		return nil, fmt.Errorf("no embedding returned from Ollama")
+	}
+	return result.Embedding, nil
+}
+
+// FallbackProvider tries the primary provider first and falls back to the
+// secondary provider on connection errors or ErrOllamaUnavailable.
+type FallbackProvider struct {
+	primary   LLMProvider
+	secondary LLMProvider
+}
+
+func NewFallbackProvider(primary, secondary LLMProvider) *FallbackProvider {
+	return &FallbackProvider{primary: primary, secondary: secondary}
+}
+
+// shouldFallback decides whether an error from the primary provider is
+// recoverable by trying the secondary. Only network-level failures and the
+// typed ErrOllamaUnavailable qualify — real API errors (bad key, bad model,
+// 4xx payload problems) surface directly.
+func shouldFallback(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrOllamaUnavailable) {
+		return true
+	}
+	return isConnectionError(err)
+}
+
+func (p *FallbackProvider) Classify(ctx context.Context, email EmailContent, allowedCategories []string) (*Classification, error) {
+	log.Printf("classify: using primary provider")
+	result, err := p.primary.Classify(ctx, email, allowedCategories)
+	if err == nil {
+		return result, nil
+	}
+	if !shouldFallback(err) || p.secondary == nil {
+		return nil, err
+	}
+	log.Printf("classify: primary failed (%v), falling back to secondary", err)
+	return p.secondary.Classify(ctx, email, allowedCategories)
+}
+
+func (p *FallbackProvider) Summarize(ctx context.Context, email EmailContent, instructions string) (string, error) {
+	log.Printf("summarize: using primary provider")
+	result, err := p.primary.Summarize(ctx, email, instructions)
+	if err == nil {
+		return result, nil
+	}
+	if !shouldFallback(err) || p.secondary == nil {
+		return "", err
+	}
+	log.Printf("summarize: primary failed (%v), falling back to secondary", err)
+	return p.secondary.Summarize(ctx, email, instructions)
+}
+
+func (p *FallbackProvider) GenerateEmbedding(ctx context.Context, text string) ([]float64, error) {
+	log.Printf("embedding: using primary provider")
+	result, err := p.primary.GenerateEmbedding(ctx, text)
+	if err == nil {
+		return result, nil
+	}
+	if !shouldFallback(err) || p.secondary == nil {
+		return nil, err
+	}
+	log.Printf("embedding: primary failed (%v), falling back to secondary", err)
+	return p.secondary.GenerateEmbedding(ctx, text)
 }
 
 // buildClassificationPrompt creates the classification prompt

@@ -149,6 +149,13 @@ func (c *Classifier) Classify(ctx context.Context, email EmailInput) (*Result, e
 	}, nil
 }
 
+// InferPriority is the exported variant of inferPriority, intended for
+// callers outside the package (e.g. digest summary generation) that need to
+// reproduce the same bucketing used during classification.
+func InferPriority(category string, metadata map[string]string) string {
+	return inferPriority(category, metadata)
+}
+
 // inferPriority determines priority based on category and metadata
 func inferPriority(category string, metadata map[string]string) string {
 	// Context-aware priority inference
