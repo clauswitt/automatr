@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
+	"strings"
 )
 
 // Classifier orchestrates the three-layer classification system
@@ -11,6 +13,8 @@ type Classifier struct {
 	rules      *RuleBasedClassifier
 	embeddings *EmbeddingsClassifier
 	llm        LLMProvider
+	jev        *JevClassifier
+	jevMinConf float64
 	learning   *LearningEngine
 	whitelist  *WhitelistManager
 	categories *CategoryManager
@@ -22,9 +26,10 @@ type Result struct {
 	Category   string
 	Confidence float64
 	Priority   string            // urgent, high, medium, low, spam
-	Method     string            // "learned_rule", "rules", "embeddings", or "llm"
+	Method     string            // "learned_rule", "rules", "jev", "embeddings", or "llm"
 	Reasoning  string
 	Metadata   map[string]string // Extracted metadata (amounts, percentages, etc)
+	Triage     *Triage           // Archive-decision probabilities; nil when Jev is unavailable
 }
 
 // NewClassifier creates a new classifier with all layers including learning
@@ -41,17 +46,54 @@ func NewClassifier(llmProvider LLMProvider, db *sql.DB, dryRun bool) *Classifier
 	}
 }
 
+// SetJev enables Jev as the primary semantic layer. Emails it is less than
+// minConfidence sure about go to "Needs Review" instead of the LLM.
+func (c *Classifier) SetJev(jev *JevClassifier, minConfidence float64) {
+	c.jev = jev
+	c.jevMinConf = minConfidence
+}
+
 // Initialize prepares the classifier (generates category embeddings)
 func (c *Classifier) Initialize(ctx context.Context) error {
 	// Seed default categories if empty
 	if err := c.categories.SeedDefaultCategories(ctx); err != nil {
 		return fmt.Errorf("failed to seed categories: %w", err)
 	}
-	return c.embeddings.Initialize(ctx)
+	if err := c.embeddings.Initialize(ctx); err != nil {
+		// Embeddings are an optional layer; without them Classify skips
+		// straight to Jev / the LLM rather than refusing to run at all.
+		log.Printf("embeddings unavailable, continuing without them: %v", err)
+	}
+	return nil
 }
 
-// Classify uses the four-layer approach to classify an email
+// Classify categorizes an email and, when Jev is configured, attaches the
+// triage probabilities used for the archive decision.
 func (c *Classifier) Classify(ctx context.Context, email EmailInput) (*Result, error) {
+	result, err := c.classifyLayers(ctx, email)
+	if err != nil || c.jev == nil || result.Triage != nil {
+		return result, err
+	}
+	triage, err := c.jev.Triage(ctx, email)
+	if err != nil {
+		log.Printf("jev triage failed, email will stay in inbox: %v", err)
+		return result, nil
+	}
+	result.Triage = triage
+	return result, nil
+}
+
+// Triage asks Jev only the archive questions, e.g. for messages classified
+// before triage existed.
+func (c *Classifier) Triage(ctx context.Context, email EmailInput) (*Triage, error) {
+	if c.jev == nil {
+		return nil, fmt.Errorf("jev not configured")
+	}
+	return c.jev.Triage(ctx, email)
+}
+
+// classifyLayers runs learned rules → rules → Jev → embeddings → LLM.
+func (c *Classifier) classifyLayers(ctx context.Context, email EmailInput) (*Result, error) {
 	// Extract metadata first
 	metadata := ExtractMetadata(email.Subject, email.Body)
 
@@ -74,7 +116,16 @@ func (c *Classifier) Classify(ctx context.Context, email EmailInput) (*Result, e
 		}, nil
 	}
 
-	// Layer 2: Embeddings
+	// Layer 2: Jev (calibrated choice over the category list)
+	if c.jev != nil {
+		result, err := c.classifyWithJev(ctx, email, metadata)
+		if err == nil {
+			return result, nil
+		}
+		log.Printf("jev classification failed, falling back to embeddings/LLM: %v", err)
+	}
+
+	// Layer 3: Embeddings
 	classification, matched := c.embeddings.Classify(ctx, email)
 	if matched && classification.Confidence >= 0.7 {
 		return &Result{
@@ -87,7 +138,7 @@ func (c *Classifier) Classify(ctx context.Context, email EmailInput) (*Result, e
 		}, nil
 	}
 
-	// Layer 3: LLM Adjudicator
+	// Layer 4: LLM Adjudicator
 	emailContent := EmailContent{
 		From:    email.From,
 		Subject: email.Subject,
@@ -122,6 +173,12 @@ func (c *Classifier) Classify(ctx context.Context, email EmailInput) (*Result, e
 		}, nil
 	}
 
+	// Generative models sometimes echo the description from the prompt
+	// ("Product Updates: Release notes, ..."); keep just the name.
+	if name, _, found := strings.Cut(classification.Category, ":"); found {
+		classification.Category = strings.TrimSpace(name)
+	}
+
 	// Ensure we never return empty category
 	if classification.Category == "" {
 		classification.Category = "Other"
@@ -146,6 +203,56 @@ func (c *Classifier) Classify(ctx context.Context, email EmailInput) (*Result, e
 		Method:     "llm",
 		Reasoning:  classification.Reasoning,
 		Metadata:   metadata,
+	}, nil
+}
+
+// classifyWithJev asks Jev to choose among the allowed categories.
+func (c *Classifier) classifyWithJev(ctx context.Context, email EmailInput, metadata map[string]string) (*Result, error) {
+	all, err := c.categories.ListCategories(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load categories: %w", err)
+	}
+
+	allowed := map[string]bool{}
+	if wl, err := c.whitelist.CheckWhitelist(ctx, email.From); err == nil && wl != nil {
+		for _, name := range wl.AllowedCategories {
+			allowed[name] = true
+		}
+	}
+
+	criteria := map[string]string{}
+	for _, cat := range all {
+		if len(allowed) > 0 && !allowed[cat.Name] {
+			continue
+		}
+		criteria[cat.Name] = cat.Description
+	}
+
+	classification, triage, err := c.jev.Classify(ctx, email, criteria)
+	if err != nil {
+		return nil, err
+	}
+
+	if classification.Confidence < c.jevMinConf {
+		return &Result{
+			Category:   "Needs Review",
+			Confidence: classification.Confidence,
+			Priority:   "medium",
+			Method:     "jev",
+			Reasoning:  "Low confidence: " + classification.Reasoning,
+			Metadata:   metadata,
+			Triage:     triage,
+		}, nil
+	}
+
+	return &Result{
+		Category:   classification.Category,
+		Confidence: classification.Confidence,
+		Priority:   inferPriority(classification.Category, metadata),
+		Method:     "jev",
+		Reasoning:  classification.Reasoning,
+		Metadata:   metadata,
+		Triage:     triage,
 	}, nil
 }
 
@@ -198,43 +305,6 @@ func inferPriority(category string, metadata map[string]string) string {
 	default:
 		return "medium"
 	}
-}
-
-// ShouldArchive determines if an email should be auto-archived
-func (c *Classifier) ShouldArchive(result *Result, email EmailInput, companyDomains []string) bool {
-	// Don't archive if dry run
-	if c.dryRun {
-		return false
-	}
-
-	// Must have high confidence
-	if result.Confidence < 0.8 {
-		return false
-	}
-
-	// Only archive specific categories
-	archiveCategories := map[string]bool{
-		"Marketing":        true,
-		"Auth":             true,
-		"Finance":          true,
-		"Product Updates":  true,
-	}
-
-	if !archiveCategories[result.Category] {
-		return false
-	}
-
-	// Never archive company emails
-	for _, domain := range companyDomains {
-		if contains(email.From, domain) {
-			return false
-		}
-	}
-
-	// Don't archive if high importance (would need to check message object)
-	// Don't archive if part of recent conversation (would need thread tracking)
-
-	return true
 }
 
 // CacheClassification stores the classification result for future reference

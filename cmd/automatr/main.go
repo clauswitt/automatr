@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/clauswitt/automatr/internal/archive"
 	"github.com/clauswitt/automatr/internal/auth"
 	"github.com/clauswitt/automatr/internal/classify"
 	"github.com/clauswitt/automatr/internal/daemon"
@@ -246,7 +248,7 @@ func initializeEmbeddings(ctx context.Context, cfg *Config, db *store.Store) err
 	}
 
 	// Create classifier and initialize
-	classifier := classify.NewClassifier(provider, db.DB(), true)
+	classifier := newClassifier(cfg, provider, db.DB(), true)
 	if err := classifier.Initialize(ctx); err != nil {
 		return err
 	}
@@ -262,14 +264,19 @@ func runDaemon(ctx context.Context, cfg *Config, client *graph.Client, db *store
 	}
 
 	// Create classifier
-	classifier := classify.NewClassifier(provider, db.DB(), true)
+	classifier := newClassifier(cfg, provider, db.DB(), true)
 	if err := classifier.Initialize(ctx); err != nil {
 		return fmt.Errorf("failed to initialize classifier: %w", err)
 	}
 
+	archiver, err := newArchiver(cfg, client, db.DB(), classifier, "")
+	if err != nil {
+		return err
+	}
+
 	// Create server with full functionality
 	srv := daemon.NewServer(db.DB(), port, autoStop)
-	srv.SetReviewServer(client, classifier)
+	srv.SetReviewServer(client, classifier, archiver)
 
 	if background {
 		// Run in background
@@ -304,7 +311,7 @@ func createDigest(ctx context.Context, cfg *Config, client *graph.Client, db *st
 	}
 
 	// Create classifier
-	classifier := classify.NewClassifier(provider, db.DB(), false)
+	classifier := newClassifier(cfg, provider, db.DB(), false)
 	if err := classifier.Initialize(ctx); err != nil {
 		return fmt.Errorf("failed to initialize classifier: %w", err)
 	}
@@ -491,7 +498,7 @@ func classifyEmail(ctx context.Context, cfg *Config, client *graph.Client, db *s
 	}
 
 	// Create classifier (dry-run mode)
-	classifier := classify.NewClassifier(provider, db.DB(), true)
+	classifier := newClassifier(cfg, provider, db.DB(), true)
 
 	// Prepare email input
 	bodyText := msg.Body.Content
@@ -520,12 +527,28 @@ func classifyEmail(ctx context.Context, cfg *Config, client *graph.Client, db *s
 	fmt.Printf("Method:     %s\n", result.Method)
 	fmt.Printf("Reasoning:  %s\n", result.Reasoning)
 
-	// Show if it would be archived
-	shouldArchive := classifier.ShouldArchive(result, emailInput, []string{"company.com"})
-	if shouldArchive {
-		fmt.Printf("\n🗄️  Would be ARCHIVED (dry-run mode)\n")
+	if result.Triage != nil {
+		fmt.Printf("Needs me:   %.2f\n", result.Triage.NeedsMe)
+		fmt.Printf("Time-bound: %.2f\n", result.Triage.TimeBound)
+	}
+
+	// Show the archive decision
+	archiver, err := newArchiver(cfg, client, db.DB(), classifier, "")
+	if err != nil {
+		return err
+	}
+	receivedAt, _ := time.Parse(time.RFC3339, msg.ReceivedDateTime)
+	decision := archiver.Policy().Decide(result.Triage, classify.MessageState{
+		From:       msg.From.EmailAddress.Address,
+		IsRead:     msg.IsRead,
+		Flagged:    msg.Flag.FlagStatus == "flagged",
+		Importance: msg.Importance,
+		ReceivedAt: receivedAt,
+	}, time.Now())
+	if decision.Archive {
+		fmt.Printf("\n🗄️  Would be ARCHIVED (%s)\n", decision.Reason)
 	} else {
-		fmt.Printf("\n📬 Would stay in INBOX\n")
+		fmt.Printf("\n📬 Would stay in INBOX (%s)\n", decision.Reason)
 	}
 
 	return nil
@@ -540,6 +563,18 @@ type Config struct {
 	DBPath       string     `yaml:"db_path"`
 	Timezone     string     `yaml:"timezone"`
 	AI           AIConfig   `yaml:"ai"`
+	Archive      ArchiveConfig `yaml:"archive"`
+}
+
+// ArchiveConfig controls auto-archiving. Decisions come from Jev's triage
+// questions; without Jev nothing is archived.
+type ArchiveConfig struct {
+	Mode           string   `yaml:"mode"`             // "dry-run" (default) logs only; "live" moves messages
+	ArchiveBelow   float64  `yaml:"archive_below"`    // archive when P(needs me) is below this
+	TimeBoundAbove float64  `yaml:"time_bound_above"` // treat as OTP/magic link above this
+	KeepAuthFor    string   `yaml:"keep_auth_for"`    // unread OTPs stay this long, e.g. "1h"
+	CompanyDomains []string `yaml:"company_domains"`  // never archive mail from these domains
+	DryRunLog      string   `yaml:"dry_run_log"`
 }
 
 type AIConfig struct {
@@ -557,6 +592,15 @@ type AIConfig struct {
 
 	// Embeddings provider (ollama or openai)
 	EmbeddingsProvider string `yaml:"embeddings_provider"`
+
+	// Jev (TypeSafe) classifies ahead of embeddings/LLM when an API key is set
+	Jev JevConfig `yaml:"jev"`
+}
+
+type JevConfig struct {
+	APIKey        string  `yaml:"api_key"`
+	Model         string  `yaml:"model"`          // e.g., "jev-latest" or a pinned "jev-1.13.0"
+	MinConfidence float64 `yaml:"min_confidence"` // below this → "Needs Review"
 }
 
 type OpenAIConfig struct {
@@ -594,6 +638,36 @@ func buildLLMProvider(cfg *Config) (classify.LLMProvider, error) {
 	default:
 		return nil, fmt.Errorf("unknown AI provider: %s", cfg.AI.Provider)
 	}
+}
+
+// newClassifier builds a classifier and enables Jev when it is configured.
+func newClassifier(cfg *Config, provider classify.LLMProvider, db *sql.DB, dryRun bool) *classify.Classifier {
+	c := classify.NewClassifier(provider, db, dryRun)
+	if cfg.AI.Jev.APIKey != "" {
+		c.SetJev(classify.NewJevClassifier(cfg.AI.Jev.APIKey, cfg.AI.Jev.Model), cfg.AI.Jev.MinConfidence)
+	}
+	return c
+}
+
+// newArchiver builds the archiver from config. A non-empty dryRunLogPath
+// (the -dry-run-log flag) forces dry-run regardless of archive.mode.
+func newArchiver(cfg *Config, client *graph.Client, db *sql.DB, classifier *classify.Classifier, dryRunLogPath string) (*archive.Archiver, error) {
+	hold, err := time.ParseDuration(cfg.Archive.KeepAuthFor)
+	if err != nil {
+		return nil, fmt.Errorf("invalid archive.keep_auth_for %q: %w", cfg.Archive.KeepAuthFor, err)
+	}
+	policy := classify.ArchivePolicy{
+		ArchiveBelow:   cfg.Archive.ArchiveBelow,
+		TimeBoundAbove: cfg.Archive.TimeBoundAbove,
+		AuthHold:       hold,
+		CompanyDomains: cfg.Archive.CompanyDomains,
+	}
+	live := cfg.Archive.Mode == "live" && dryRunLogPath == ""
+	logPath := cfg.Archive.DryRunLog
+	if dryRunLogPath != "" {
+		logPath = dryRunLogPath
+	}
+	return archive.New(db, client, classifier, policy, live, logPath), nil
 }
 
 // buildEmbeddingsProvider constructs the provider used for generating embeddings.
@@ -687,6 +761,33 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.AI.Ollama.EmbedModel == "" {
 		cfg.AI.Ollama.EmbedModel = "nomic-embed-text"
 	}
+	if cfg.AI.Jev.Model == "" {
+		cfg.AI.Jev.Model = "jev-latest"
+	}
+	if cfg.AI.Jev.MinConfidence == 0 {
+		cfg.AI.Jev.MinConfidence = 0.6
+	}
+
+	// Archive defaults
+	if cfg.Archive.Mode == "" {
+		cfg.Archive.Mode = "dry-run"
+	}
+	if cfg.Archive.ArchiveBelow == 0 {
+		cfg.Archive.ArchiveBelow = 0.15
+	}
+	if cfg.Archive.TimeBoundAbove == 0 {
+		cfg.Archive.TimeBoundAbove = 0.5
+	}
+	if cfg.Archive.KeepAuthFor == "" {
+		cfg.Archive.KeepAuthFor = "1h"
+	}
+	if cfg.Archive.DryRunLog == "" {
+		cfg.Archive.DryRunLog = "~/.automatr/would-archive.log"
+	}
+	if strings.HasPrefix(cfg.Archive.DryRunLog, "~/") {
+		home, _ := os.UserHomeDir()
+		cfg.Archive.DryRunLog = filepath.Join(home, cfg.Archive.DryRunLog[2:])
+	}
 
 	return &cfg, nil
 }
@@ -700,7 +801,7 @@ func processPendingFeedback(ctx context.Context, cfg *Config, db *store.Store) e
 	}
 
 	// Create classifier
-	classifier := classify.NewClassifier(provider, db.DB(), false)
+	classifier := newClassifier(cfg, provider, db.DB(), false)
 
 	// Initialize embeddings
 	if err := classifier.Initialize(ctx); err != nil {
@@ -717,53 +818,10 @@ func processPendingFeedback(ctx context.Context, cfg *Config, db *store.Store) e
 	return nil
 }
 
-// dryRunLogger writes WOULD-ARCHIVE lines to a file instead of performing
-// real archive operations. A nil value means "not in dry-run mode".
-type dryRunLogger struct {
-	f     *os.File
-	count int
-}
-
-func newDryRunLogger(path string) (*dryRunLogger, error) {
-	if path == "" {
-		return nil, nil
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open dry-run log %s: %w", path, err)
-	}
-	return &dryRunLogger{f: f}, nil
-}
-
-func (d *dryRunLogger) log(category string, confidence float64, from, subject string) {
-	if d == nil {
-		return
-	}
-	line := fmt.Sprintf("[WOULD-ARCHIVE] %s | %s | %.2f | %s | %s\n",
-		time.Now().Format(time.RFC3339), category, confidence, from, subject)
-	_, _ = d.f.WriteString(line)
-	d.count++
-}
-
-func (d *dryRunLogger) close() {
-	if d != nil && d.f != nil {
-		_ = d.f.Close()
-	}
-}
-
 func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *store.Store, timespan, outputFile string, noSummary bool, dryRunLogPath string) error {
 	duration, err := parseTimespan(timespan)
 	if err != nil {
 		return fmt.Errorf("invalid timespan: %w", err)
-	}
-
-	dryLog, err := newDryRunLogger(dryRunLogPath)
-	if err != nil {
-		return err
-	}
-	defer dryLog.close()
-	if dryLog != nil {
-		fmt.Printf("🧪 Dry-run mode: archive actions will be logged to %s (no messages will be moved)\n", dryRunLogPath)
 	}
 
 	fmt.Printf("🔄 Syncing emails from the last %s...\n\n", duration)
@@ -783,13 +841,20 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 		return err
 	}
 
-	classifier := classify.NewClassifier(provider, db.DB(), false) // NOT dry-run
+	classifier := newClassifier(cfg, provider, db.DB(), false) // NOT dry-run
 	if err := classifier.Initialize(ctx); err != nil {
 		return fmt.Errorf("failed to initialize classifier: %w", err)
 	}
 
+	archiver, err := newArchiver(cfg, client, db.DB(), classifier, dryRunLogPath)
+	if err != nil {
+		return err
+	}
+	if !archiver.Live() {
+		fmt.Printf("   🧪 Archive dry-run: decisions logged to %s (no messages will be moved)\n", archiver.LogPath())
+	}
+
 	newCount := 0
-	archivedCount := 0
 
 	// Step 2: Process each message
 	fmt.Println("\n📋 Step 2/4: Processing messages...")
@@ -799,30 +864,17 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 		err := db.DB().QueryRowContext(ctx, `SELECT id, category FROM messages WHERE id = ?`, msg.ID).Scan(&existingID, &existingCategory)
 
 		if err == nil {
-			// Already exists - check if needs archiving
-			cat, err := classifier.GetCategoryManager().GetCategory(ctx, existingCategory)
-			if err == nil && cat != nil && !cat.KeepInInbox {
-				if dryLog != nil {
-					dryLog.log(existingCategory, 1.0, msg.From.EmailAddress.Address, msg.Subject)
-				} else {
-					archiveFolderID, err := client.GetFolder(ctx, "Archive")
-					if err == nil {
-						movedMsg, err := client.MoveMessage(ctx, msg.ID, archiveFolderID)
-						if err == nil && movedMsg != nil {
-							db.DB().ExecContext(ctx, `UPDATE messages SET id = ?, raw_link = ? WHERE id = ?`,
-								movedMsg.ID, movedMsg.WebLink, msg.ID)
-							archivedCount++
-						}
-					}
-				}
+			// Already exists - re-decide (e.g. an OTP that has since been read)
+			if _, err := archiver.Process(ctx, msg, existingCategory, nil); err != nil {
+				fmt.Printf("   ⚠️  Archive failed: %v\n", err)
 			}
 			continue
 		}
 
 		// New message - classify it
 		bodyText := msg.Body.Content
-		if len(bodyText) > 1000 {
-			bodyText = bodyText[:1000]
+		if len(bodyText) > 4000 {
+			bodyText = bodyText[:4000]
 		}
 
 		email := classify.EmailInput{
@@ -850,22 +902,9 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 
 		newCount++
 
-		// Auto-archive if needed
-		cat, err := classifier.GetCategoryManager().GetCategory(ctx, result.Category)
-		if err == nil && cat != nil && !cat.KeepInInbox {
-			if dryLog != nil {
-				dryLog.log(result.Category, result.Confidence, msg.From.EmailAddress.Address, msg.Subject)
-			} else {
-				archiveFolderID, err := client.GetFolder(ctx, "Archive")
-				if err == nil {
-					movedMsg, err := client.MoveMessage(ctx, msg.ID, archiveFolderID)
-					if err == nil && movedMsg != nil {
-						db.DB().ExecContext(ctx, `UPDATE messages SET id = ?, raw_link = ? WHERE id = ?`,
-							movedMsg.ID, movedMsg.WebLink, msg.ID)
-						archivedCount++
-					}
-				}
-			}
+		// Auto-archive if it doesn't need personal attention
+		if _, err := archiver.Process(ctx, msg, result.Category, result.Triage); err != nil {
+			fmt.Printf("   ⚠️  Archive failed: %v\n", err)
 		}
 
 		if (i+1)%10 == 0 {
@@ -874,7 +913,9 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 	}
 
 	fmt.Printf("   ✓ Classified %d new messages\n", newCount)
-	fmt.Printf("   ✓ Archived %d messages\n\n", archivedCount)
+	if archiver.Live() {
+		fmt.Printf("   ✓ Archived %d messages\n\n", archiver.Archived)
+	}
 
 	// Step 3: Generate summaries (cached for future digests)
 	digestSvc := summarize.NewDigestService(db.DB(), classifier, client)
@@ -899,10 +940,11 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 		ORDER BY m.received_at DESC
 	`, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
 
-	if noSummary {
-		fmt.Printf("   ✓ Skipped summary generation\n\n")
-	} else if err != nil {
+	if err != nil {
 		fmt.Printf("   ⚠️  Failed to query messages: %v\n\n", err)
+	} else if noSummary {
+		rows.Close()
+		fmt.Printf("   ✓ Skipped summary generation\n\n")
 	} else {
 		// Collect all messages first (don't hold cursor while processing)
 		type msgInfo struct {
@@ -1016,8 +1058,8 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 		fmt.Print(output)
 	}
 
-	if dryLog != nil {
-		fmt.Printf("\n🧪 Dry-run: %d messages would have been archived (logged to %s)\n", dryLog.count, dryRunLogPath)
+	if !archiver.Live() {
+		fmt.Printf("\n🧪 Dry-run: %d messages would have been archived (logged to %s)\n", archiver.Archived, archiver.LogPath())
 	}
 
 	fmt.Println("\n✅ Sync complete!")
@@ -1050,7 +1092,7 @@ func batchReview(ctx context.Context, cfg *Config, client *graph.Client, db *sto
 	}
 
 	// Create classifier
-	classifier := classify.NewClassifier(provider, db.DB(), true) // dry-run mode
+	classifier := newClassifier(cfg, provider, db.DB(), true) // dry-run mode
 
 	// Initialize
 	if err := classifier.Initialize(ctx); err != nil {
@@ -1093,8 +1135,8 @@ func batchReview(ctx context.Context, cfg *Config, client *graph.Client, db *sto
 
 		// Prepare email input
 		bodyText := msg.Body.Content
-		if len(bodyText) > 1000 {
-			bodyText = bodyText[:1000]
+		if len(bodyText) > 4000 {
+			bodyText = bodyText[:4000]
 		}
 
 		emailInput := classify.EmailInput{
@@ -1152,8 +1194,12 @@ func batchReview(ctx context.Context, cfg *Config, client *graph.Client, db *sto
 
 	// Start review daemon with UI
 	fmt.Println("\n🚀 Starting review UI...")
+	archiver, err := newArchiver(cfg, client, db.DB(), classifier, "")
+	if err != nil {
+		return err
+	}
 	srv := daemon.NewServer(db.DB(), 8383, false)
-	srv.SetReviewServer(client, classifier)
+	srv.SetReviewServer(client, classifier, archiver)
 
 	fmt.Println("\n✅ Review UI ready!")
 	fmt.Println("   Open: http://localhost:8383/review")

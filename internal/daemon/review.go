@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/clauswitt/automatr/internal/archive"
 	"github.com/clauswitt/automatr/internal/classify"
 	"github.com/clauswitt/automatr/internal/graph"
 	"github.com/clauswitt/automatr/internal/summarize"
@@ -22,6 +23,7 @@ type ReviewServer struct {
 	client     *graph.Client
 	classifier *classify.Classifier
 	digestSvc  *summarize.DigestService
+	archiver   *archive.Archiver
 }
 
 type ReviewMessage struct {
@@ -507,23 +509,8 @@ func (r *ReviewServer) HandleCreateDigest(w http.ResponseWriter, req *http.Reque
 		startTime = endTime.Add(-duration)
 	}
 
-	// IMPORTANT: Archive emails BEFORE creating digest so digest has correct post-archive URLs
-	// First, get a preview of what will be in the digest to know what to archive
-	previewDigest, err := r.digestSvc.CreateDigest(ctx, startTime, endTime)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Archive emails that should be archived (this updates webLinks in database)
-	archivedCount, err := r.digestSvc.ArchiveDigestEmails(ctx, previewDigest)
-	if err != nil {
-		log.Printf("Warning: Failed to archive emails: %v", err)
-	} else if archivedCount > 0 {
-		log.Printf("✓ Archived %d emails (webLinks updated)", archivedCount)
-	}
-
-	// Now create the actual digest with correct (post-archive) webLinks
+	// Archiving happens during email processing (archive.Archiver), so the
+	// digest already sees post-archive webLinks.
 	digest, err := r.digestSvc.CreateDigest(ctx, startTime, endTime)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -819,6 +806,25 @@ func (r *ReviewServer) StartScheduler(ctx context.Context) {
 	}
 }
 
+// archive applies the archive policy; without an archiver nothing is moved.
+func (r *ReviewServer) archive(ctx context.Context, msg graph.Message, category string, triage *classify.Triage) {
+	if r.archiver == nil {
+		return
+	}
+	decision, err := r.archiver.Process(ctx, msg, category, triage)
+	if err != nil {
+		log.Printf("Archive failed for %s: %v", msg.Subject, err)
+		return
+	}
+	if decision.Archive {
+		verb := "Auto-archived"
+		if !r.archiver.Live() {
+			verb = "Would archive"
+		}
+		log.Printf("✓ %s: %s (%s; %s)", verb, msg.Subject, category, decision.Reason)
+	}
+}
+
 func (r *ReviewServer) processEmails(ctx context.Context) {
 	log.Println("Processing emails...")
 
@@ -862,27 +868,15 @@ func (r *ReviewServer) processEmails(ctx context.Context) {
 				log.Printf("Updated message ID for %s (moved from %s to %s)", msg.Subject, existingID, msg.ID)
 			}
 
-			// Check if this existing message should be archived
-			cat, err := r.classifier.GetCategoryManager().GetCategory(ctx, existingCategory)
-			if err == nil && cat != nil && !cat.KeepInInbox {
-				archiveFolderID, err := r.client.GetFolder(ctx, "Archive")
-				if err == nil {
-					movedMsg, err := r.client.MoveMessage(ctx, msg.ID, archiveFolderID)
-					if err == nil && movedMsg != nil && movedMsg.WebLink != "" {
-						// Update both ID and webLink since ID changes when moved to Archive
-						_, _ = r.db.ExecContext(ctx, `UPDATE messages SET id = ?, raw_link = ? WHERE id = ?`,
-							movedMsg.ID, movedMsg.WebLink, msg.ID)
-						log.Printf("✓ Auto-archived existing: %s (category: %s)", msg.Subject, existingCategory)
-					}
-				}
-			}
+			// Re-decide archiving (e.g. an OTP that has since been read)
+			r.archive(ctx, msg, existingCategory, nil)
 			continue
 		}
 
 		// Email is new, classify it
 		bodyText := msg.Body.Content
-		if len(bodyText) > 1000 {
-			bodyText = bodyText[:1000]
+		if len(bodyText) > 4000 {
+			bodyText = bodyText[:4000]
 		}
 
 		email := classify.EmailInput{
@@ -908,20 +902,8 @@ func (r *ReviewServer) processEmails(ctx context.Context) {
 			continue
 		}
 
-		// Auto-archive immediately if category has keep_in_inbox = 0
-		cat, err := r.classifier.GetCategoryManager().GetCategory(ctx, result.Category)
-		if err == nil && cat != nil && !cat.KeepInInbox {
-			archiveFolderID, err := r.client.GetFolder(ctx, "Archive")
-			if err == nil {
-				movedMsg, err := r.client.MoveMessage(ctx, msg.ID, archiveFolderID)
-				if err == nil && movedMsg != nil && movedMsg.WebLink != "" {
-					// Update both ID and webLink since ID changes when moved to Archive
-					_, _ = r.db.ExecContext(ctx, `UPDATE messages SET id = ?, raw_link = ? WHERE id = ?`,
-						movedMsg.ID, movedMsg.WebLink, msg.ID)
-					log.Printf("✓ Auto-archived: %s (category: %s)", msg.Subject, result.Category)
-				}
-			}
-		}
+		// Auto-archive if it doesn't need personal attention
+		r.archive(ctx, msg, result.Category, result.Triage)
 
 		newCount++
 		processedCount++

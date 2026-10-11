@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -40,6 +41,11 @@ type Message struct {
 	Body               Body      `json:"body"`
 	Categories         []string  `json:"categories"`
 	WebLink            string    `json:"webLink"`
+	Flag               Flag      `json:"flag"`
+}
+
+type Flag struct {
+	FlagStatus string `json:"flagStatus"` // notFlagged, flagged, complete
 }
 
 type Recipient struct {
@@ -62,9 +68,13 @@ type MessageList struct {
 	DeltaLink     string    `json:"@odata.deltaLink"`
 }
 
+func escapeODataQuery(value string) string {
+	return strings.ReplaceAll(url.QueryEscape(value), "+", "%20")
+}
+
 // ListMessages retrieves the most recent messages from the inbox
 func (c *Client) ListMessages(ctx context.Context, top int) ([]Message, error) {
-	endpoint := fmt.Sprintf("%s/me/mailFolders/inbox/messages?$top=%d&$orderby=receivedDateTime desc", baseURL, top)
+	endpoint := fmt.Sprintf("%s/me/mailFolders/inbox/messages?$top=%d&$orderby=receivedDateTime%%20desc", baseURL, top)
 
 	var result MessageList
 	if err := c.get(ctx, endpoint, &result); err != nil {
@@ -83,8 +93,8 @@ func (c *Client) ListRecentMessages(ctx context.Context, since time.Time) ([]Mes
 	var allMessages []Message
 
 	// Query inbox folder
-	inboxEndpoint := fmt.Sprintf("%s/me/mailFolders/inbox/messages?$filter=%s&$orderby=receivedDateTime desc&$top=999",
-		baseURL, url.QueryEscape(filter))
+	inboxEndpoint := fmt.Sprintf("%s/me/mailFolders/inbox/messages?$filter=%s&$orderby=receivedDateTime%%20desc&$top=999",
+		baseURL, escapeODataQuery(filter))
 
 	for inboxEndpoint != "" {
 		var result MessageList
@@ -98,8 +108,8 @@ func (c *Client) ListRecentMessages(ctx context.Context, since time.Time) ([]Mes
 	// Query archive folder
 	archiveID, err := c.GetFolder(ctx, "Archive")
 	if err == nil {
-		archiveEndpoint := fmt.Sprintf("%s/me/mailFolders/%s/messages?$filter=%s&$orderby=receivedDateTime desc&$top=999",
-			baseURL, archiveID, url.QueryEscape(filter))
+		archiveEndpoint := fmt.Sprintf("%s/me/mailFolders/%s/messages?$filter=%s&$orderby=receivedDateTime%%20desc&$top=999",
+			baseURL, archiveID, escapeODataQuery(filter))
 
 		for archiveEndpoint != "" {
 			var result MessageList
@@ -123,8 +133,8 @@ func (c *Client) ListInboxMessagesSince(ctx context.Context, since time.Time) ([
 	var allMessages []Message
 
 	// Query ONLY inbox folder
-	endpoint := fmt.Sprintf("%s/me/mailFolders/inbox/messages?$filter=%s&$orderby=receivedDateTime desc&$top=999",
-		baseURL, url.QueryEscape(filter))
+	endpoint := fmt.Sprintf("%s/me/mailFolders/inbox/messages?$filter=%s&$orderby=receivedDateTime%%20desc&$top=999",
+		baseURL, escapeODataQuery(filter))
 
 	for endpoint != "" {
 		var result MessageList
@@ -140,7 +150,7 @@ func (c *Client) ListInboxMessagesSince(ctx context.Context, since time.Time) ([
 
 // SearchMessages searches for messages by subject or sender
 func (c *Client) SearchMessages(ctx context.Context, query string) ([]Message, error) {
-	endpoint := fmt.Sprintf("%s/me/messages?$search=\"%s\"&$top=20", baseURL, url.QueryEscape(query))
+	endpoint := fmt.Sprintf("%s/me/messages?$search=\"%s\"&$top=20", baseURL, escapeODataQuery(query))
 
 	var result MessageList
 	if err := c.get(ctx, endpoint, &result); err != nil {
@@ -152,7 +162,7 @@ func (c *Client) SearchMessages(ctx context.Context, query string) ([]Message, e
 
 // ListUnreadMessages retrieves all recent messages (not just inbox)
 func (c *Client) ListUnreadMessages(ctx context.Context, top int) ([]Message, error) {
-	endpoint := fmt.Sprintf("%s/me/messages?$top=%d&$orderby=receivedDateTime DESC", baseURL, top)
+	endpoint := fmt.Sprintf("%s/me/messages?$top=%d&$orderby=receivedDateTime%%20DESC", baseURL, top)
 
 	var result MessageList
 	if err := c.get(ctx, endpoint, &result); err != nil {
@@ -208,7 +218,7 @@ func (c *Client) ListFolders(ctx context.Context) ([]Folder, error) {
 func (c *Client) GetFolder(ctx context.Context, folderName string) (string, error) {
 	// Construct filter with proper encoding
 	filter := fmt.Sprintf("displayName eq '%s'", folderName)
-	endpoint := fmt.Sprintf("%s/me/mailFolders?$filter=%s", baseURL, url.QueryEscape(filter))
+	endpoint := fmt.Sprintf("%s/me/mailFolders?$filter=%s", baseURL, escapeODataQuery(filter))
 
 	var result struct {
 		Value []struct {
@@ -253,7 +263,7 @@ func (c *Client) GetMessageByInternetMessageId(ctx context.Context, internetMess
 	}
 
 	filter := fmt.Sprintf("internetMessageId eq '%s'", msgID)
-	endpoint := fmt.Sprintf("%s/me/messages?$filter=%s&$top=1", baseURL, url.QueryEscape(filter))
+	endpoint := fmt.Sprintf("%s/me/messages?$filter=%s&$top=1", baseURL, escapeODataQuery(filter))
 
 	var result MessageList
 	if err := c.get(ctx, endpoint, &result); err != nil {
@@ -303,6 +313,9 @@ func (c *Client) get(ctx context.Context, endpoint string, result interface{}) e
 
 	req.Header.Set("Authorization", "Bearer "+c.accessToken)
 	req.Header.Set("Content-Type", "application/json")
+	// Bodies feed classification and summaries; HTML would waste the truncated
+	// prefix on <head>/<style> markup instead of the actual message.
+	req.Header.Set("Prefer", `outlook.body-content-type="text"`)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

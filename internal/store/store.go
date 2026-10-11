@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -227,6 +228,8 @@ func (s *Store) runMigrations() error {
 			break
 		}
 	}
+	// Release the connection before running more statements (single-connection pool)
+	rows.Close()
 
 	// Add pattern_type column if it doesn't exist
 	if !hasPatternType {
@@ -238,6 +241,31 @@ func (s *Store) runMigrations() error {
 		}
 	}
 
+	// Jev triage probabilities, kept so later syncs can re-decide (e.g. release
+	// an OTP once it has been read) without asking Jev again.
+	for _, col := range []string{"needs_me REAL", "time_bound REAL"} {
+		if err := s.addColumnIfMissing("messages", col); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// addColumnIfMissing adds a column ("name TYPE") to table unless it exists.
+func (s *Store) addColumnIfMissing(table, columnDef string) error {
+	name := strings.Fields(columnDef)[0]
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, name).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("failed to inspect %s: %w", table, err)
+	}
+	if count > 0 {
+		return nil
+	}
+	if _, err := s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", table, columnDef)); err != nil {
+		return fmt.Errorf("failed to add %s.%s: %w", table, name, err)
+	}
 	return nil
 }
 

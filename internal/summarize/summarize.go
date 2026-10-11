@@ -355,58 +355,6 @@ func (d *DigestService) GenerateMetaSummary(ctx context.Context, digest *DigestS
 	return metaSummary, nil
 }
 
-// ArchiveDigestEmails archives emails from the digest where keep_in_inbox = 0
-// Note: This will invalidate webLinks, so only use after digest is viewed/exported
-func (d *DigestService) ArchiveDigestEmails(ctx context.Context, digest *DigestSummary) (int, error) {
-	// Get Archive folder ID
-	archiveFolderID, err := d.client.GetFolder(ctx, "Archive")
-	if err != nil {
-		return 0, fmt.Errorf("failed to get Archive folder: %w", err)
-	}
-
-	archivedCount := 0
-
-	// Process each category
-	for category, emails := range digest.Categories {
-		// Check if this category should be archived
-		cat, err := d.classifier.GetCategoryManager().GetCategory(ctx, category)
-		if err != nil || cat == nil {
-			continue // Skip if category not found
-		}
-
-		// Only archive if keep_in_inbox is false
-		if cat.KeepInInbox {
-			continue
-		}
-
-		// Archive all emails in this category
-		for _, email := range emails {
-			movedMsg, err := d.client.MoveMessage(ctx, email.MessageID, archiveFolderID)
-			if err != nil {
-				// Skip 404 errors (already archived) silently
-				// Only log other errors
-				if err.Error() != "" && !contains(err.Error(), "404") && !contains(err.Error(), "ErrorItemNotFound") {
-					fmt.Printf("Failed to archive message %s: %v\n", email.MessageID, err)
-				}
-				continue
-			}
-
-			// Update database with new ID and webLink from archived location
-			if movedMsg != nil {
-				// Update both ID and webLink since ID changes when moved to Archive
-				if movedMsg.WebLink != "" {
-					_, _ = d.db.ExecContext(ctx, `UPDATE messages SET id = ?, raw_link = ? WHERE id = ?`,
-						movedMsg.ID, movedMsg.WebLink, email.MessageID)
-				}
-			}
-
-			archivedCount++
-		}
-	}
-
-	return archivedCount, nil
-}
-
 // summaryFilePath returns the companion summary file path for a digest output.
 // e.g. "/tmp/digest.md" -> "/tmp/digest.summary.md".
 // If the input has no ".md" suffix, ".summary.md" is appended verbatim.

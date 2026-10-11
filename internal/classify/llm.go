@@ -12,12 +12,17 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
 // ErrOllamaUnavailable is returned when the Ollama server is unreachable.
 // Callers can use errors.Is to detect this and fall back to a secondary provider.
 var ErrOllamaUnavailable = errors.New("ollama unavailable")
+
+// ollamaCooldown is how long the provider stops calling Ollama after a
+// connection failure, so one outage costs one timeout instead of one per email.
+const ollamaCooldown = 5 * time.Minute
 
 // LLMProvider abstracts LLM API calls for classification
 type LLMProvider interface {
@@ -375,6 +380,9 @@ type OllamaProvider struct {
 	model      string
 	embedModel string
 	client     *http.Client
+
+	mu        sync.Mutex
+	downUntil time.Time
 }
 
 func NewOllamaProvider(baseURL, model, embedModel string) *OllamaProvider {
@@ -382,8 +390,29 @@ func NewOllamaProvider(baseURL, model, embedModel string) *OllamaProvider {
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		model:      model,
 		embedModel: embedModel,
-		client:     &http.Client{Timeout: 120 * time.Second},
+		// Local 3B model: cold load + generation is a few seconds; anything
+		// beyond this means Ollama is stuck, not slow.
+		client: &http.Client{Timeout: 30 * time.Second},
 	}
+}
+
+// preflight fails fast when a music app is running or Ollama recently failed.
+func (p *OllamaProvider) preflight() error {
+	if StudioBusy() {
+		return fmt.Errorf("%w: music app running, skipping local inference", ErrOllamaUnavailable)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if time.Now().Before(p.downUntil) {
+		return fmt.Errorf("%w: cooling down after failure until %s", ErrOllamaUnavailable, p.downUntil.Format("15:04:05"))
+	}
+	return nil
+}
+
+func (p *OllamaProvider) markDown() {
+	p.mu.Lock()
+	p.downUntil = time.Now().Add(ollamaCooldown)
+	p.mu.Unlock()
 }
 
 // isConnectionError reports whether err looks like a network-level failure
@@ -406,6 +435,7 @@ func isConnectionError(err error) bool {
 
 func (p *OllamaProvider) wrapConnErr(err error) error {
 	if isConnectionError(err) {
+		p.markDown()
 		return fmt.Errorf("%w: %v", ErrOllamaUnavailable, err)
 	}
 	return err
@@ -465,6 +495,10 @@ func (p *OllamaProvider) Summarize(ctx context.Context, email EmailContent, inst
 }
 
 func (p *OllamaProvider) chatCompletion(ctx context.Context, reqBody map[string]interface{}) (string, error) {
+	if err := p.preflight(); err != nil {
+		return "", err
+	}
+
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", err
@@ -487,6 +521,7 @@ func (p *OllamaProvider) chatCompletion(ctx context.Context, reqBody map[string]
 		body, _ := io.ReadAll(resp.Body)
 		// 5xx from the Ollama process itself is effectively "unavailable"
 		if resp.StatusCode >= 500 {
+			p.markDown()
 			return "", fmt.Errorf("%w: Ollama API error %d: %s", ErrOllamaUnavailable, resp.StatusCode, string(body))
 		}
 		return "", fmt.Errorf("Ollama API error %d: %s", resp.StatusCode, string(body))
@@ -509,6 +544,10 @@ func (p *OllamaProvider) chatCompletion(ctx context.Context, reqBody map[string]
 }
 
 func (p *OllamaProvider) GenerateEmbedding(ctx context.Context, text string) ([]float64, error) {
+	if err := p.preflight(); err != nil {
+		return nil, err
+	}
+
 	reqBody := map[string]interface{}{
 		"model":  p.embedModel,
 		"prompt": text,
@@ -535,6 +574,7 @@ func (p *OllamaProvider) GenerateEmbedding(ctx context.Context, text string) ([]
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 500 {
+			p.markDown()
 			return nil, fmt.Errorf("%w: Ollama embeddings error %d: %s", ErrOllamaUnavailable, resp.StatusCode, string(body))
 		}
 		return nil, fmt.Errorf("Ollama embeddings error %d: %s", resp.StatusCode, string(body))

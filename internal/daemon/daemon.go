@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/clauswitt/automatr/internal/archive"
 	"github.com/clauswitt/automatr/internal/classify"
 	"github.com/clauswitt/automatr/internal/graph"
 )
@@ -44,8 +45,9 @@ func NewServer(db *sql.DB, port int, autoStop bool) *Server {
 }
 
 // SetReviewServer sets the review server for UI functionality
-func (s *Server) SetReviewServer(client *graph.Client, classifier *classify.Classifier) {
+func (s *Server) SetReviewServer(client *graph.Client, classifier *classify.Classifier, archiver *archive.Archiver) {
 	s.reviewServer = NewReviewServer(s.db, client, classifier)
+	s.reviewServer.archiver = archiver
 }
 
 // Start begins the HTTP server
