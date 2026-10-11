@@ -20,6 +20,11 @@ import (
 // Callers can use errors.Is to detect this and fall back to a secondary provider.
 var ErrOllamaUnavailable = errors.New("ollama unavailable")
 
+// ErrStudioBusy means local inference was skipped because a music app is
+// running. It wraps ErrOllamaUnavailable; summaries do not fall back to a
+// cloud provider for it and are retried on a later run instead.
+var ErrStudioBusy = fmt.Errorf("%w: music app running, skipping local inference", ErrOllamaUnavailable)
+
 // ollamaCooldown is how long the provider stops calling Ollama after a
 // connection failure, so one outage costs one timeout instead of one per email.
 const ollamaCooldown = 5 * time.Minute
@@ -399,7 +404,7 @@ func NewOllamaProvider(baseURL, model, embedModel string) *OllamaProvider {
 // preflight fails fast when a music app is running or Ollama recently failed.
 func (p *OllamaProvider) preflight() error {
 	if StudioBusy() {
-		return fmt.Errorf("%w: music app running, skipping local inference", ErrOllamaUnavailable)
+		return ErrStudioBusy
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -636,7 +641,8 @@ func (p *FallbackProvider) Summarize(ctx context.Context, email EmailContent, in
 	if err == nil {
 		return result, nil
 	}
-	if !shouldFallback(err) || p.secondary == nil {
+	// Deferred, not failed: catch up locally once the studio session ends
+	if errors.Is(err, ErrStudioBusy) || !shouldFallback(err) || p.secondary == nil {
 		return "", err
 	}
 	log.Printf("summarize: primary failed (%v), falling back to secondary", err)

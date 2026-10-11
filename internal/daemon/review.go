@@ -564,7 +564,8 @@ func (r *ReviewServer) HandleViewDigest(w http.ResponseWriter, req *http.Request
 		SELECT m.id, m.subject, m.from_addr, m.category, m.received_at,
 		       COALESCE(de.weblink, m.raw_link) as weblink,
 		       m.internet_message_id,
-		       COALESCE(es.summary, '') as summary
+		       COALESCE(es.summary, '') as summary,
+		       m.archived_at IS NOT NULL
 		FROM messages m
 		LEFT JOIN email_summaries es ON m.id = es.message_id
 		LEFT JOIN digest_emails de ON de.digest_id = ? AND de.message_id = m.id
@@ -582,8 +583,9 @@ func (r *ReviewServer) HandleViewDigest(w http.ResponseWriter, req *http.Request
 		var msgID, subject, fromAddr, category, webLink, summary string
 		var internetMessageId sql.NullString
 		var receivedAt time.Time
+		var archived bool
 
-		if err := rows.Scan(&msgID, &subject, &fromAddr, &category, &receivedAt, &webLink, &internetMessageId, &summary); err != nil {
+		if err := rows.Scan(&msgID, &subject, &fromAddr, &category, &receivedAt, &webLink, &internetMessageId, &summary, &archived); err != nil {
 			continue
 		}
 
@@ -599,18 +601,24 @@ func (r *ReviewServer) HandleViewDigest(w http.ResponseWriter, req *http.Request
 			Summary:    summary,
 			WebLink:    webLink, // From digest_emails table (preserved at digest creation time)
 			ReceivedAt: receivedAt,
+			Archived:   archived,
 		})
 	}
 
 	// Get category importance order
 	categoryOrder, _ := r.digestSvc.GetCategoryImportance(ctx)
 
+	inbox, filed := digest.Split()
 	data := struct {
 		Digest        *summarize.DigestSummary
 		CategoryOrder []string
+		Inbox         map[string][]summarize.EmailSummary
+		FiledAway     []summarize.EmailSummary
 	}{
 		Digest:        digest,
-		CategoryOrder: categoryOrder,
+		CategoryOrder: summarize.OrderedCategories(categoryOrder, inbox),
+		Inbox:         inbox,
+		FiledAway:     filed,
 	}
 
 	tmpl := template.Must(template.New("digest-view").Parse(digestViewTemplate))
@@ -651,7 +659,8 @@ func (r *ReviewServer) HandleExportDigestMarkdown(w http.ResponseWriter, req *ht
 	// Load emails
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT m.id, m.subject, m.from_addr, m.category, m.received_at, m.raw_link, m.internet_message_id,
-		       COALESCE(es.summary, '') as summary
+		       COALESCE(es.summary, '') as summary,
+		       m.archived_at IS NOT NULL
 		FROM messages m
 		LEFT JOIN email_summaries es ON m.id = es.message_id
 		WHERE datetime(m.received_at) >= datetime(?) AND datetime(m.received_at) < datetime(?)
@@ -668,8 +677,9 @@ func (r *ReviewServer) HandleExportDigestMarkdown(w http.ResponseWriter, req *ht
 		var msgID, subject, fromAddr, category, webLink, summary string
 		var internetMessageId sql.NullString
 		var receivedAt time.Time
+		var archived bool
 
-		if err := rows.Scan(&msgID, &subject, &fromAddr, &category, &receivedAt, &webLink, &internetMessageId, &summary); err != nil {
+		if err := rows.Scan(&msgID, &subject, &fromAddr, &category, &receivedAt, &webLink, &internetMessageId, &summary, &archived); err != nil {
 			continue
 		}
 
@@ -699,6 +709,7 @@ func (r *ReviewServer) HandleExportDigestMarkdown(w http.ResponseWriter, req *ht
 			Summary:    summary,
 			WebLink:    currentWebLink,
 			ReceivedAt: receivedAt,
+			Archived:   archived,
 		})
 	}
 
@@ -714,22 +725,7 @@ func (r *ReviewServer) HandleExportDigestMarkdown(w http.ResponseWriter, req *ht
 		markdown.WriteString("\n\n---\n\n")
 	}
 
-	for _, category := range categoryOrder {
-		emails, ok := digest.Categories[category]
-		if !ok || len(emails) == 0 {
-			continue
-		}
-
-		markdown.WriteString(fmt.Sprintf("## %s (%d)\n\n", category, len(emails)))
-
-		for _, email := range emails {
-			// Remove the outlook link suffix from summary if present
-			summary := strings.Split(email.Summary, "\n\n🔗")[0]
-			markdown.WriteString(fmt.Sprintf("- %s [↗](%s)\n", summary, email.WebLink))
-		}
-
-		markdown.WriteString("\n")
-	}
+	summarize.WriteMarkdownSections(&markdown, digest, categoryOrder)
 
 	// Set headers for download
 	w.Header().Set("Content-Type", "text/markdown")
@@ -1958,7 +1954,7 @@ const digestViewTemplate = `
 
     {{range .CategoryOrder}}
         {{$category := .}}
-        {{$emails := index $.Digest.Categories $category}}
+        {{$emails := index $.Inbox $category}}
         {{if $emails}}
         <div class="category-section">
             <div class="category-header">{{$category}} ({{len $emails}})</div>
@@ -1970,6 +1966,18 @@ const digestViewTemplate = `
             {{end}}
         </div>
         {{end}}
+    {{end}}
+
+    {{if .FiledAway}}
+    <div class="category-section">
+        <div class="category-header">Filed away ({{len .FiledAway}})</div>
+        {{range .FiledAway}}
+        <div class="email-item">
+            <div class="email-summary">{{.Category}} · {{.From}} — {{.Subject}}</div>
+            <a href="{{.WebLink}}" class="email-link" target="_blank">↗ Open in Outlook</a>
+        </div>
+        {{end}}
+    </div>
     {{end}}
 </body>
 </html>

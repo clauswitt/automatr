@@ -36,6 +36,12 @@ func (c *EmbeddingsClassifier) Initialize(ctx context.Context) error {
 	// Check if we already have cached category embeddings
 	for category, embedding := range c.examples {
 		if len(embedding) == 0 {
+			// Reuse the cached embedding from an earlier run
+			if cached, err := c.getCachedEmbedding(ctx, "category:"+category); err == nil && len(cached) > 0 {
+				c.examples[category] = cached
+				continue
+			}
+
 			// Generate embedding for this category example
 			text := getCategoryExampleText(category)
 			emb, err := c.provider.GenerateEmbedding(ctx, text)

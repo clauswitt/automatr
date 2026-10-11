@@ -28,6 +28,7 @@ type EmailSummary struct {
 	Summary     string
 	WebLink     string
 	ReceivedAt  time.Time
+	Archived    bool // auto-archived; listed as a one-liner under "Filed away"
 }
 
 type DigestSummary struct {
@@ -37,6 +38,74 @@ type DigestSummary struct {
 	MetaSummary  string
 	Categories   map[string][]EmailSummary
 	CreatedAt    time.Time
+}
+
+// Split separates emails still in the inbox (by category) from archived ones.
+func (d *DigestSummary) Split() (inbox map[string][]EmailSummary, filed []EmailSummary) {
+	inbox = make(map[string][]EmailSummary)
+	for category, emails := range d.Categories {
+		for _, e := range emails {
+			if e.Archived {
+				filed = append(filed, e)
+			} else {
+				inbox[category] = append(inbox[category], e)
+			}
+		}
+	}
+	sort.Slice(filed, func(i, j int) bool { return filed[i].ReceivedAt.After(filed[j].ReceivedAt) })
+	return inbox, filed
+}
+
+// OrderedCategories returns categoryOrder with any categories present in
+// emails but missing from it (e.g. "Needs Review") added: "Needs Review"
+// first, since it needs a human, and the rest at the end.
+func OrderedCategories(categoryOrder []string, emails map[string][]EmailSummary) []string {
+	known := make(map[string]bool, len(categoryOrder))
+	for _, c := range categoryOrder {
+		known[c] = true
+	}
+	var extra []string
+	for c := range emails {
+		if !known[c] && c != "Needs Review" {
+			extra = append(extra, c)
+		}
+	}
+	sort.Strings(extra)
+
+	var ordered []string
+	if _, ok := emails["Needs Review"]; ok && !known["Needs Review"] {
+		ordered = append(ordered, "Needs Review")
+	}
+	ordered = append(ordered, categoryOrder...)
+	return append(ordered, extra...)
+}
+
+// WriteMarkdownSections writes the per-category sections for inbox mail,
+// followed by a one-line-per-email "Filed away" section for archived mail.
+func WriteMarkdownSections(b *strings.Builder, digest *DigestSummary, categoryOrder []string) {
+	inbox, filed := digest.Split()
+
+	for _, category := range OrderedCategories(categoryOrder, inbox) {
+		emails := inbox[category]
+		if len(emails) == 0 {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("## %s (%d)\n\n", category, len(emails)))
+		for _, email := range emails {
+			// Remove the outlook link suffix from summary if present
+			summary := strings.Split(email.Summary, "\n\n🔗")[0]
+			b.WriteString(fmt.Sprintf("- %s [↗](%s)\n", summary, email.WebLink))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(filed) > 0 {
+		b.WriteString(fmt.Sprintf("## Filed away (%d)\n\n", len(filed)))
+		for _, email := range filed {
+			b.WriteString(fmt.Sprintf("- %s · %s — %s [↗](%s)\n", email.Category, email.From, email.Subject, email.WebLink))
+		}
+		b.WriteString("\n")
+	}
 }
 
 func NewDigestService(db *sql.DB, classifier *classify.Classifier, client *graph.Client) *DigestService {
@@ -110,7 +179,8 @@ func (d *DigestService) CreateDigest(ctx context.Context, startTime, endTime tim
 	// Get all messages in the time range (no deduplication - show all messages in range)
 	// Use datetime() to handle timezone-aware timestamps correctly
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT m.id, m.subject, m.from_addr, m.category, m.received_at, m.raw_link, m.internet_message_id
+		SELECT m.id, m.subject, m.from_addr, m.category, m.received_at, m.raw_link, m.internet_message_id,
+		       m.archived_at IS NOT NULL
 		FROM messages m
 		WHERE datetime(m.received_at) >= datetime(?) AND datetime(m.received_at) < datetime(?)
 		ORDER BY m.received_at DESC
@@ -129,12 +199,13 @@ func (d *DigestService) CreateDigest(ctx context.Context, startTime, endTime tim
 		receivedAt         time.Time
 		webLink            string
 		internetMessageId  sql.NullString
+		archived           bool
 	}
 
 	var messagesToProcess []msgInfo
 	for rows.Next() {
 		var msg msgInfo
-		if err := rows.Scan(&msg.id, &msg.subject, &msg.fromAddr, &msg.category, &msg.receivedAt, &msg.webLink, &msg.internetMessageId); err != nil {
+		if err := rows.Scan(&msg.id, &msg.subject, &msg.fromAddr, &msg.category, &msg.receivedAt, &msg.webLink, &msg.internetMessageId, &msg.archived); err != nil {
 			continue
 		}
 		messagesToProcess = append(messagesToProcess, msg)
@@ -145,6 +216,21 @@ func (d *DigestService) CreateDigest(ctx context.Context, startTime, endTime tim
 
 	// Now process all messages without holding cursor
 	for _, msgInfo := range messagesToProcess {
+		// Archived mail is only listed, never summarized
+		if msgInfo.archived {
+			categorizedEmails[msgInfo.category] = append(categorizedEmails[msgInfo.category], EmailSummary{
+				MessageID:  msgInfo.id,
+				Subject:    msgInfo.subject,
+				From:       msgInfo.fromAddr,
+				Category:   msgInfo.category,
+				Summary:    fmt.Sprintf("**%s** - %s", msgInfo.subject, msgInfo.fromAddr),
+				WebLink:    msgInfo.webLink,
+				ReceivedAt: msgInfo.receivedAt,
+				Archived:   true,
+			})
+			continue
+		}
+
 		// Check if we already have a cached summary
 		var cachedSummary string
 		err := d.db.QueryRowContext(ctx, `SELECT summary FROM email_summaries WHERE message_id = ?`, msgInfo.id).Scan(&cachedSummary)
@@ -163,12 +249,15 @@ func (d *DigestService) CreateDigest(ctx context.Context, startTime, endTime tim
 			continue
 		}
 
-		// No cached summary - need to fetch message body for summarization
+		// No cached summary - need to fetch message body for summarization.
+		// While a music app runs, summaries are deferred, so don't fetch.
 		var msg *graph.Message
-		if msgInfo.internetMessageId.Valid && msgInfo.internetMessageId.String != "" {
+		if classify.StudioBusy() {
+			// falls through to the simple summary below
+		} else if msgInfo.internetMessageId.Valid && msgInfo.internetMessageId.String != "" {
 			msg, _ = d.client.GetMessageByInternetMessageId(ctx, msgInfo.internetMessageId.String)
 		}
-		if msg == nil {
+		if msg == nil && !classify.StudioBusy() {
 			msg, _ = d.client.GetMessage(ctx, msgInfo.id)
 		}
 
@@ -305,11 +394,14 @@ func (d *DigestService) GenerateMetaSummary(ctx context.Context, digest *DigestS
 	totalEmails := 0
 	urgentCount := 0
 
+	inbox, filed := digest.Split()
 	categoryBreakdown := make(map[string]int)
+	for _, emails := range digest.Categories {
+		totalEmails += len(emails)
+	}
 
-	for category, emails := range digest.Categories {
+	for category, emails := range inbox {
 		count := len(emails)
-		totalEmails += count
 		categoryBreakdown[category] = count
 
 		// Count as urgent if it's in a high-priority category
@@ -325,18 +417,19 @@ func (d *DigestService) GenerateMetaSummary(ctx context.Context, digest *DigestS
 		return "No emails in this period.", nil
 	}
 
-	metaSummary := fmt.Sprintf("📧 **%d emails** received", totalEmails)
+	metaSummary := fmt.Sprintf("📧 **%d emails** received: %d still in inbox, %d filed away",
+		totalEmails, totalEmails-len(filed), len(filed))
 
 	if urgentCount > 0 {
 		metaSummary += fmt.Sprintf(" (%d urgent/high priority)", urgentCount)
 	}
 
-	metaSummary += "\n\n**Breakdown by category:**\n"
+	metaSummary += "\n\n**Still in inbox, by category:**\n"
 
 	// Get sorted categories
 	sortedCategories, _ := d.GetCategoryImportance(ctx)
 
-	for _, category := range sortedCategories {
+	for _, category := range OrderedCategories(sortedCategories, inbox) {
 		if count, ok := categoryBreakdown[category]; ok && count > 0 {
 			metaSummary += fmt.Sprintf("- %s: %d\n", category, count)
 		}
@@ -381,17 +474,6 @@ func (d *DigestService) WriteSummaryFile(ctx context.Context, digest *DigestSumm
 	}
 	path := summaryFilePath(digestPath)
 
-	// Pre-fetch category metadata so we know which categories are archived
-	// (KeepInInbox=false) and can infer per-message priority.
-	catMgr := d.classifier.GetCategoryManager()
-	categoryMeta := make(map[string]*classify.Category)
-	for category := range digest.Categories {
-		cat, err := catMgr.GetCategory(ctx, category)
-		if err == nil && cat != nil {
-			categoryMeta[category] = cat
-		}
-	}
-
 	type scored struct {
 		email    EmailSummary
 		priority string
@@ -406,12 +488,9 @@ func (d *DigestService) WriteSummaryFile(ctx context.Context, digest *DigestSumm
 	totalProcessed := 0
 
 	for category, emails := range digest.Categories {
-		cat := categoryMeta[category]
-		isArchived := cat != nil && !cat.KeepInInbox
-
 		for _, email := range emails {
 			totalProcessed++
-			if isArchived {
+			if email.Archived {
 				archivedCounts[category]++
 				archivedTotal++
 			} else {
@@ -419,6 +498,9 @@ func (d *DigestService) WriteSummaryFile(ctx context.Context, digest *DigestSumm
 			}
 			if category == "Needs Review" {
 				needsReview++
+			}
+			if email.Archived {
+				continue // Jev judged it doesn't need attention
 			}
 
 			metadata := classify.ExtractMetadata(email.Subject, "")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -371,23 +372,7 @@ func createDigest(ctx context.Context, cfg *Config, client *graph.Client, db *st
 		markdown.WriteString("\n\n")
 	}
 
-	// Write emails by category
-	for _, category := range categoryOrder {
-		emails, ok := digest.Categories[category]
-		if !ok || len(emails) == 0 {
-			continue
-		}
-
-		markdown.WriteString(fmt.Sprintf("## %s (%d)\n\n", category, len(emails)))
-
-		for _, email := range emails {
-			// Remove the outlook link suffix from summary if present
-			summary := strings.Split(email.Summary, "\n\n🔗")[0]
-			markdown.WriteString(fmt.Sprintf("- %s [↗](%s)\n", summary, email.WebLink))
-		}
-
-		markdown.WriteString("\n")
-	}
+	summarize.WriteMarkdownSections(&markdown, digest, categoryOrder)
 
 	// Output to file or stdout
 	output := markdown.String()
@@ -937,6 +922,7 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 		WHERE datetime(m.received_at) >= datetime(?)
 		  AND datetime(m.received_at) < datetime(?)
 		  AND s.message_id IS NULL
+		  AND m.archived_at IS NULL
 		ORDER BY m.received_at DESC
 	`, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
 
@@ -995,6 +981,10 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 
 				// Generate and cache summary
 				_, err = digestSvc.GetOrCreateSummary(ctx, msgInfo.id, emailInput, msgInfo.category, msgInfo.webLink)
+				if errors.Is(err, classify.ErrStudioBusy) {
+					fmt.Printf("   🎛️  Music app running: deferring %d summaries to a later run\n", totalCount-i)
+					break
+				}
 				if err == nil {
 					summaryCount++
 				} else {
@@ -1034,19 +1024,7 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 		markdown.WriteString("\n\n")
 	}
 
-	for _, category := range categoryOrder {
-		emails, ok := digest.Categories[category]
-		if !ok || len(emails) == 0 {
-			continue
-		}
-
-		markdown.WriteString(fmt.Sprintf("## %s (%d)\n\n", category, len(emails)))
-		for _, email := range emails {
-			summary := strings.Split(email.Summary, "\n\n🔗")[0]
-			markdown.WriteString(fmt.Sprintf("- %s [↗](%s)\n", summary, email.WebLink))
-		}
-		markdown.WriteString("\n")
-	}
+	summarize.WriteMarkdownSections(&markdown, digest, categoryOrder)
 
 	output := markdown.String()
 	if outputFile != "" {
