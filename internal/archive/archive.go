@@ -50,6 +50,7 @@ func (a *Archiver) Process(ctx context.Context, msg graph.Message, category stri
 	receivedAt, _ := time.Parse(time.RFC3339, msg.ReceivedDateTime)
 	decision := a.policy.Decide(triage, classify.MessageState{
 		From:       msg.From.EmailAddress.Address,
+		Subject:    msg.Subject,
 		IsRead:     msg.IsRead,
 		Flagged:    msg.Flag.FlagStatus == "flagged",
 		Importance: msg.Importance,
@@ -80,17 +81,20 @@ func (a *Archiver) Process(ctx context.Context, msg graph.Message, category stri
 }
 
 func (a *Archiver) saveTriage(ctx context.Context, id string, t *classify.Triage) {
-	_, _ = a.db.ExecContext(ctx, `UPDATE messages SET needs_me = ?, time_bound = ? WHERE id = ?`, t.NeedsMe, t.TimeBound, id)
+	_, _ = a.db.ExecContext(ctx, `UPDATE messages SET needs_me = ?, time_bound = ?, cold_outreach = ? WHERE id = ?`,
+		t.NeedsMe, t.TimeBound, t.ColdOutreach, id)
 }
 
 func (a *Archiver) loadOrFetchTriage(ctx context.Context, msg graph.Message) *classify.Triage {
-	var needsMe, timeBound sql.NullFloat64
-	err := a.db.QueryRowContext(ctx, `SELECT needs_me, time_bound FROM messages WHERE id = ?`, msg.ID).Scan(&needsMe, &timeBound)
-	if err == nil && needsMe.Valid && timeBound.Valid {
-		return &classify.Triage{NeedsMe: needsMe.Float64, TimeBound: timeBound.Float64}
+	var needsMe, timeBound, coldOutreach sql.NullFloat64
+	err := a.db.QueryRowContext(ctx, `SELECT needs_me, time_bound, cold_outreach FROM messages WHERE id = ?`, msg.ID).
+		Scan(&needsMe, &timeBound, &coldOutreach)
+	if err == nil && needsMe.Valid && timeBound.Valid && coldOutreach.Valid {
+		return &classify.Triage{NeedsMe: needsMe.Float64, TimeBound: timeBound.Float64, ColdOutreach: coldOutreach.Float64}
 	}
 
-	// Classified before triage existed: ask once and remember the answer
+	// Missing or incomplete (classified before a triage question existed):
+	// ask once and remember the answer
 	t, err := a.classifier.Triage(ctx, classify.EmailInput{
 		From:    msg.From.EmailAddress.Address,
 		Subject: msg.Subject,

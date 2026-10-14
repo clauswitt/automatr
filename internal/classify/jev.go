@@ -42,21 +42,38 @@ type jevQuestion struct {
 
 // Triage holds Jev's probabilities for the archive decision.
 type Triage struct {
-	NeedsMe   float64 // P(the mailbox owner must personally read/reply/act)
-	TimeBound float64 // P(one-time code / magic link / reset that expires soon)
-	Model     string
+	NeedsMe      float64 // P(the mailbox owner must personally read/reply/act)
+	TimeBound    float64 // P(one-time code / magic link / reset that expires soon)
+	ColdOutreach float64 // P(unsolicited pitch from a stranger selling to the owner)
+	Model        string
 }
 
 var triageQuestions = map[string]jevQuestion{
 	"needs_me": {
 		Type: "noul",
-		Instructions: "Does the recipient (the mailbox owner) need to personally read, reply to, " +
-			"decide on or act on this email?",
+		Instructions: "Would the recipient (the mailbox owner) miss something important if this email were filed away unread? " +
+			"Answer yes only if this specific email needs them to personally reply, decide, approve, pay or fix something, " +
+			"or a real person is writing to them directly.",
 		Criteria: map[string]string{
-			"true": "A real person or client writing to the recipient; a question or request addressed to them; " +
-				"something they must approve, pay, fix or respond to; a security alert about their own account that may need action.",
-			"false": "Newsletters, marketing, automated notifications, receipts, product updates, status digests " +
-				"and FYI mail that can be filed without reading.",
+			"true": "A real person writing directly to the recipient; a question or request addressed to them personally; " +
+				"a failed or overdue payment; a security problem with their own account; a production incident they must fix.",
+			"false": "Automated notifications and digests (e.g. 'you have N unread notifications', something was approved, " +
+				"completed or updated), reminders pointing to another app where the work happens, newsletters, marketing and " +
+				"win-back offers, receipts, credit or plan updates, product updates and other FYI mail.",
+		},
+	},
+	"cold_outreach": {
+		Type: "noul",
+		Instructions: "Is this unsolicited cold outreach where a stranger is trying to sell something TO the recipient: " +
+			"their own product, service, agency work, funding or investment offer, paid media feature, or a meeting to pitch it?",
+		Criteria: map[string]string{
+			"true": "Mass or templated pitches from people or companies with no existing relationship, including fake 'Re:' " +
+				"threads, 'quick follow-up' chasers, flattering 'question about your company' openers, investor or capital " +
+				"pitches, and paid PR or feature offers.",
+			"false": "Someone who wants to buy from, hire, or become a customer of the recipient's company (inbound leads, " +
+				"demo or pricing requests); introductions referred by a named mutual contact; partnership proposals that name " +
+				"a mutual contact; replies in real conversations; existing clients, colleagues, support tickets; automated " +
+				"notifications and receipts.",
 		},
 	},
 	"time_bound": {
@@ -140,12 +157,19 @@ func (j *JevClassifier) Triage(ctx context.Context, email EmailInput) (*Triage, 
 }
 
 func triageFrom(result *jevResponse) (*Triage, error) {
-	needsMe, ok1 := result.Answers["needs_me"]
-	timeBound, ok2 := result.Answers["time_bound"]
-	if !ok1 || !ok2 || needsMe.Noul == nil || timeBound.Noul == nil {
-		return nil, fmt.Errorf("jev: missing triage answers in response")
+	t := &Triage{Model: result.Model}
+	for id, dst := range map[string]*float64{
+		"needs_me":      &t.NeedsMe,
+		"time_bound":    &t.TimeBound,
+		"cold_outreach": &t.ColdOutreach,
+	} {
+		answer, ok := result.Answers[id]
+		if !ok || answer.Noul == nil {
+			return nil, fmt.Errorf("jev: missing %s answer in response", id)
+		}
+		*dst = *answer.Noul
 	}
-	return &Triage{NeedsMe: *needsMe.Noul, TimeBound: *timeBound.Noul, Model: result.Model}, nil
+	return t, nil
 }
 
 func (j *JevClassifier) evaluate(ctx context.Context, email EmailInput, questions map[string]jevQuestion) (*jevResponse, error) {

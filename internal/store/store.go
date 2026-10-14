@@ -243,7 +243,7 @@ func (s *Store) runMigrations() error {
 
 	// Jev triage probabilities, kept so later syncs can re-decide (e.g. release
 	// an OTP once it has been read) without asking Jev again.
-	for _, col := range []string{"needs_me REAL", "time_bound REAL"} {
+	for _, col := range []string{"needs_me REAL", "time_bound REAL", "cold_outreach REAL"} {
 		if err := s.addColumnIfMissing("messages", col); err != nil {
 			return err
 		}

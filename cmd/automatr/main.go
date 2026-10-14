@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"errors"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -20,6 +20,7 @@ import (
 	"github.com/clauswitt/automatr/internal/graph"
 	"github.com/clauswitt/automatr/internal/store"
 	"github.com/clauswitt/automatr/internal/summarize"
+	"github.com/clauswitt/automatr/internal/todoist"
 	"gopkg.in/yaml.v3"
 )
 
@@ -27,32 +28,32 @@ const version = "0.1.0"
 
 func main() {
 	var (
-		configPath     = flag.String("config", os.ExpandEnv("$HOME/.automatr/config.yaml"), "Path to config file")
-		showVersion    = flag.Bool("version", false, "Show version")
-		authOnly       = flag.Bool("auth", false, "Run authentication flow only")
-		listCmd        = flag.Bool("list", false, "List recent emails")
-		unreadCmd      = flag.Bool("unread", false, "List unread emails only")
-		foldersCmd     = flag.Bool("folders", false, "List all mail folders")
-		searchCmd      = flag.String("search", "", "Search emails by subject/sender")
-		readCmd        = flag.String("read", "", "Read email by ID")
-		classifyCmd    = flag.String("classify", "", "Classify email by ID")
-		initEmbedCmd   = flag.Bool("init-embeddings", false, "Initialize category embeddings")
-		reviewCmd      = flag.Bool("review", false, "Batch review and classify recent emails")
-		reviewTimespan = flag.String("review-timespan", "48h", "Timespan to review (e.g., 24h, 48h, 7d, 2w)")
+		configPath      = flag.String("config", os.ExpandEnv("$HOME/.automatr/config.yaml"), "Path to config file")
+		showVersion     = flag.Bool("version", false, "Show version")
+		authOnly        = flag.Bool("auth", false, "Run authentication flow only")
+		listCmd         = flag.Bool("list", false, "List recent emails")
+		unreadCmd       = flag.Bool("unread", false, "List unread emails only")
+		foldersCmd      = flag.Bool("folders", false, "List all mail folders")
+		searchCmd       = flag.String("search", "", "Search emails by subject/sender")
+		readCmd         = flag.String("read", "", "Read email by ID")
+		classifyCmd     = flag.String("classify", "", "Classify email by ID")
+		initEmbedCmd    = flag.Bool("init-embeddings", false, "Initialize category embeddings")
+		reviewCmd       = flag.Bool("review", false, "Batch review and classify recent emails")
+		reviewTimespan  = flag.String("review-timespan", "48h", "Timespan to review (e.g., 24h, 48h, 7d, 2w)")
 		processFeedback = flag.Bool("process-feedback", false, "Process pending user feedback to improve classification")
-		daemonCmd      = flag.Bool("daemon", false, "Start feedback daemon server")
-		daemonPort     = flag.Int("daemon-port", 8383, "Daemon server port")
-		daemonAutoStop = flag.Bool("daemon-auto-stop", false, "Auto-stop daemon after 24h inactivity")
-		daemonBg       = flag.Bool("daemon-background", false, "Run daemon in background")
-		digestCmd      = flag.Bool("digest", false, "Create email digest in markdown format")
-		digestTimespan = flag.String("digest-timespan", "auto", "Digest timespan (auto, 4h, 12h, 24h, 48h, 7d, 14d)")
-		digestOutput   = flag.String("digest-output", "", "Output file for digest (stdout if empty)")
-		migrateLinks   = flag.Bool("migrate-links", false, "Migrate existing messages to use stable Message-ID links")
-		syncCmd        = flag.Bool("sync", false, "Sync emails: fetch, classify, archive, and create digest (one-shot)")
-		syncTimespan   = flag.String("sync-timespan", "48h", "Timespan to sync (e.g., 24h, 48h, 7d, 2w)")
-		syncOutput     = flag.String("sync-output", "", "Output file for digest (stdout if empty)")
-		syncNoSummary  = flag.Bool("sync-no-summary", false, "Skip AI summary generation (faster, just show subject lines)")
-		dryRunLog      = flag.String("dry-run-log", "", "If set, do NOT archive — append [WOULD-ARCHIVE] lines to this file instead")
+		daemonCmd       = flag.Bool("daemon", false, "Start feedback daemon server")
+		daemonPort      = flag.Int("daemon-port", 8383, "Daemon server port")
+		daemonAutoStop  = flag.Bool("daemon-auto-stop", false, "Auto-stop daemon after 24h inactivity")
+		daemonBg        = flag.Bool("daemon-background", false, "Run daemon in background")
+		digestCmd       = flag.Bool("digest", false, "Create email digest in markdown format")
+		digestTimespan  = flag.String("digest-timespan", "auto", "Digest timespan (auto, 4h, 12h, 24h, 48h, 7d, 14d)")
+		digestOutput    = flag.String("digest-output", "", "Output file for digest (stdout if empty)")
+		migrateLinks    = flag.Bool("migrate-links", false, "Migrate existing messages to use stable Message-ID links")
+		syncCmd         = flag.Bool("sync", false, "Sync emails: fetch, classify, archive, and create digest (one-shot)")
+		syncTimespan    = flag.String("sync-timespan", "48h", "Timespan to sync (e.g., 24h, 48h, 7d, 2w, or all for the whole inbox)")
+		syncOutput      = flag.String("sync-output", "", "Output file for digest (stdout if empty)")
+		syncNoSummary   = flag.Bool("sync-no-summary", false, "Skip AI summary generation (faster, just show subject lines)")
+		dryRunLog       = flag.String("dry-run-log", "", "If set, do NOT archive — append [WOULD-ARCHIVE] lines to this file instead")
 	)
 	flag.Parse()
 
@@ -515,6 +516,7 @@ func classifyEmail(ctx context.Context, cfg *Config, client *graph.Client, db *s
 	if result.Triage != nil {
 		fmt.Printf("Needs me:   %.2f\n", result.Triage.NeedsMe)
 		fmt.Printf("Time-bound: %.2f\n", result.Triage.TimeBound)
+		fmt.Printf("Cold:       %.2f\n", result.Triage.ColdOutreach)
 	}
 
 	// Show the archive decision
@@ -525,6 +527,7 @@ func classifyEmail(ctx context.Context, cfg *Config, client *graph.Client, db *s
 	receivedAt, _ := time.Parse(time.RFC3339, msg.ReceivedDateTime)
 	decision := archiver.Policy().Decide(result.Triage, classify.MessageState{
 		From:       msg.From.EmailAddress.Address,
+		Subject:    msg.Subject,
 		IsRead:     msg.IsRead,
 		Flagged:    msg.Flag.FlagStatus == "flagged",
 		Importance: msg.Importance,
@@ -540,26 +543,32 @@ func classifyEmail(ctx context.Context, cfg *Config, client *graph.Client, db *s
 }
 
 type Config struct {
-	ClientID     string     `yaml:"client_id"`
-	ClientSecret string     `yaml:"client_secret"`
-	TenantID     string     `yaml:"tenant_id"`
-	RedirectURI  string     `yaml:"redirect_uri"`
-	Scopes       []string   `yaml:"scopes"`
-	DBPath       string     `yaml:"db_path"`
-	Timezone     string     `yaml:"timezone"`
-	AI           AIConfig   `yaml:"ai"`
+	ClientID     string        `yaml:"client_id"`
+	ClientSecret string        `yaml:"client_secret"`
+	TenantID     string        `yaml:"tenant_id"`
+	RedirectURI  string        `yaml:"redirect_uri"`
+	Scopes       []string      `yaml:"scopes"`
+	DBPath       string        `yaml:"db_path"`
+	Timezone     string        `yaml:"timezone"`
+	AI           AIConfig      `yaml:"ai"`
 	Archive      ArchiveConfig `yaml:"archive"`
+	Todoist      TodoistConfig `yaml:"todoist"`
 }
 
 // ArchiveConfig controls auto-archiving. Decisions come from Jev's triage
 // questions; without Jev nothing is archived.
 type ArchiveConfig struct {
-	Mode           string   `yaml:"mode"`             // "dry-run" (default) logs only; "live" moves messages
-	ArchiveBelow   float64  `yaml:"archive_below"`    // archive when P(needs me) is below this
-	TimeBoundAbove float64  `yaml:"time_bound_above"` // treat as OTP/magic link above this
-	KeepAuthFor    string   `yaml:"keep_auth_for"`    // unread OTPs stay this long, e.g. "1h"
-	CompanyDomains []string `yaml:"company_domains"`  // never archive mail from these domains
+	Mode           string   `yaml:"mode"`                // "dry-run" (default) logs only; "live" moves messages
+	ArchiveBelow   float64  `yaml:"archive_below"`       // archive when P(needs me) is below this
+	TimeBoundAbove float64  `yaml:"time_bound_above"`    // treat as OTP/magic link above this
+	ColdAbove      float64  `yaml:"cold_outreach_above"` // archive unsolicited pitches above this
+	KeepAuthFor    string   `yaml:"keep_auth_for"`       // unread OTPs stay this long, e.g. "1h"
+	CompanyDomains []string `yaml:"company_domains"`     // never archive mail from these domains
 	DryRunLog      string   `yaml:"dry_run_log"`
+
+	// Explicit sender rules, applied before Jev (flags and high importance still win)
+	AlwaysKeep    []classify.SenderRule `yaml:"always_keep"`
+	AlwaysArchive []classify.SenderRule `yaml:"always_archive"`
 }
 
 type AIConfig struct {
@@ -604,6 +613,19 @@ type OllamaConfig struct {
 	EmbedModel string `yaml:"embed_model"` // e.g., "nomic-embed-text"
 }
 
+type TodoistConfig struct {
+	Enabled          bool                  `yaml:"enabled"`
+	APITokenEnv      string                `yaml:"api_token_env"`
+	ProjectID        string                `yaml:"project_id"`
+	Labels           []string              `yaml:"labels"`
+	Priority         int                   `yaml:"priority"`
+	NeedsMeAbove     float64               `yaml:"needs_me_above"`
+	DefaultDueIn     string                `yaml:"default_due_in"`
+	AlwaysTask       []classify.SenderRule `yaml:"always_task"`
+	SkipTimeBound    bool                  `yaml:"skip_time_bound"`
+	SkipColdOutreach bool                  `yaml:"skip_cold_outreach"`
+}
+
 // buildLLMProvider constructs the primary LLM provider for classification/summarization.
 // When the primary is ollama and an OpenAI key is present, the result is wrapped
 // in a FallbackProvider so callers transparently survive a local Ollama outage.
@@ -642,10 +664,13 @@ func newArchiver(cfg *Config, client *graph.Client, db *sql.DB, classifier *clas
 		return nil, fmt.Errorf("invalid archive.keep_auth_for %q: %w", cfg.Archive.KeepAuthFor, err)
 	}
 	policy := classify.ArchivePolicy{
-		ArchiveBelow:   cfg.Archive.ArchiveBelow,
-		TimeBoundAbove: cfg.Archive.TimeBoundAbove,
-		AuthHold:       hold,
-		CompanyDomains: cfg.Archive.CompanyDomains,
+		ArchiveBelow:      cfg.Archive.ArchiveBelow,
+		TimeBoundAbove:    cfg.Archive.TimeBoundAbove,
+		ColdOutreachAbove: cfg.Archive.ColdAbove,
+		AuthHold:          hold,
+		CompanyDomains:    cfg.Archive.CompanyDomains,
+		AlwaysKeep:        cfg.Archive.AlwaysKeep,
+		AlwaysArchive:     cfg.Archive.AlwaysArchive,
 	}
 	live := cfg.Archive.Mode == "live" && dryRunLogPath == ""
 	logPath := cfg.Archive.DryRunLog
@@ -653,6 +678,76 @@ func newArchiver(cfg *Config, client *graph.Client, db *sql.DB, classifier *clas
 		logPath = dryRunLogPath
 	}
 	return archive.New(db, client, classifier, policy, live, logPath), nil
+}
+
+func newTodoistClient(cfg *Config) (*todoist.Client, time.Duration, error) {
+	due, err := time.ParseDuration(cfg.Todoist.DefaultDueIn)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid todoist.default_due_in %q: %w", cfg.Todoist.DefaultDueIn, err)
+	}
+	if !cfg.Todoist.Enabled {
+		return nil, due, nil
+	}
+	token := os.Getenv(cfg.Todoist.APITokenEnv)
+	if token == "" {
+		return nil, due, fmt.Errorf("%s is not set", cfg.Todoist.APITokenEnv)
+	}
+	return todoist.NewClient(token), due, nil
+}
+
+func loadStoredTriage(ctx context.Context, db *sql.DB, id string) *classify.Triage {
+	var needsMe, timeBound, coldOutreach sql.NullFloat64
+	err := db.QueryRowContext(ctx, `SELECT needs_me, time_bound, cold_outreach FROM messages WHERE id = ?`, id).
+		Scan(&needsMe, &timeBound, &coldOutreach)
+	if err != nil || !needsMe.Valid || !timeBound.Valid || !coldOutreach.Valid {
+		return nil
+	}
+	return &classify.Triage{NeedsMe: needsMe.Float64, TimeBound: timeBound.Float64, ColdOutreach: coldOutreach.Float64}
+}
+
+func upsertTodoistTask(ctx context.Context, cfg *Config, client *todoist.Client, fallbackDue time.Duration, msg graph.Message, category string, triage *classify.Triage) (string, error) {
+	if triage == nil {
+		return "", nil
+	}
+	if cfg.Todoist.SkipTimeBound && triage.TimeBound > cfg.Archive.TimeBoundAbove {
+		return "", nil
+	}
+	if cfg.Todoist.SkipColdOutreach && triage.ColdOutreach > cfg.Archive.ColdAbove {
+		return "", nil
+	}
+
+	ruleMatched := false
+	for _, rule := range cfg.Todoist.AlwaysTask {
+		if rule.Matches(msg.From.EmailAddress.Address, msg.Subject) {
+			ruleMatched = true
+			break
+		}
+	}
+	if !ruleMatched && triage.NeedsMe < cfg.Todoist.NeedsMeAbove {
+		return "", nil
+	}
+
+	receivedAt, _ := time.Parse(time.RFC3339, msg.ReceivedDateTime)
+	body := msg.Body.Content
+	if len(body) > 4000 {
+		body = body[:4000]
+	}
+	reason := fmt.Sprintf("Automatr classified this as requiring attention (needs_me %.2f, category %s).", triage.NeedsMe, category)
+	if ruleMatched {
+		reason = fmt.Sprintf("Automatr matched an explicit email-action rule (needs_me %.2f, category %s).", triage.NeedsMe, category)
+	}
+	return client.UpsertEmailTask(ctx, todoist.EmailTask{
+		Subject:    msg.Subject,
+		From:       msg.From.EmailAddress.Address,
+		ReceivedAt: receivedAt,
+		WebLink:    msg.WebLink,
+		Body:       body,
+		DueDate:    todoist.InferDueDate(time.Now(), msg.Subject, body, fallbackDue),
+		Priority:   cfg.Todoist.Priority,
+		ProjectID:  cfg.Todoist.ProjectID,
+		Labels:     cfg.Todoist.Labels,
+		Reason:     reason,
+	})
 }
 
 // buildEmbeddingsProvider constructs the provider used for generating embeddings.
@@ -758,10 +853,13 @@ func loadConfig(path string) (*Config, error) {
 		cfg.Archive.Mode = "dry-run"
 	}
 	if cfg.Archive.ArchiveBelow == 0 {
-		cfg.Archive.ArchiveBelow = 0.15
+		cfg.Archive.ArchiveBelow = 0.3
 	}
 	if cfg.Archive.TimeBoundAbove == 0 {
 		cfg.Archive.TimeBoundAbove = 0.5
+	}
+	if cfg.Archive.ColdAbove == 0 {
+		cfg.Archive.ColdAbove = 0.85
 	}
 	if cfg.Archive.KeepAuthFor == "" {
 		cfg.Archive.KeepAuthFor = "1h"
@@ -772,6 +870,27 @@ func loadConfig(path string) (*Config, error) {
 	if strings.HasPrefix(cfg.Archive.DryRunLog, "~/") {
 		home, _ := os.UserHomeDir()
 		cfg.Archive.DryRunLog = filepath.Join(home, cfg.Archive.DryRunLog[2:])
+	}
+	if cfg.Todoist.APITokenEnv == "" {
+		cfg.Todoist.APITokenEnv = "TODOIST_API_TOKEN"
+	}
+	if cfg.Todoist.Priority == 0 {
+		cfg.Todoist.Priority = 4
+	}
+	if cfg.Todoist.NeedsMeAbove == 0 {
+		cfg.Todoist.NeedsMeAbove = 0.8
+	}
+	if cfg.Todoist.DefaultDueIn == "" {
+		cfg.Todoist.DefaultDueIn = "48h"
+	}
+	if len(cfg.Todoist.Labels) == 0 {
+		cfg.Todoist.Labels = []string{"@agent-generated", "email-action"}
+	}
+	if !cfg.Todoist.SkipTimeBound {
+		cfg.Todoist.SkipTimeBound = true
+	}
+	if !cfg.Todoist.SkipColdOutreach {
+		cfg.Todoist.SkipColdOutreach = true
 	}
 
 	return &cfg, nil
@@ -804,16 +923,21 @@ func processPendingFeedback(ctx context.Context, cfg *Config, db *store.Store) e
 }
 
 func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *store.Store, timespan, outputFile string, noSummary bool, dryRunLogPath string) error {
-	duration, err := parseTimespan(timespan)
-	if err != nil {
-		return fmt.Errorf("invalid timespan: %w", err)
+	// "all" processes the whole inbox regardless of age
+	since := time.Unix(0, 0)
+	if timespan == "all" {
+		fmt.Printf("🔄 Syncing the whole inbox...\n\n")
+	} else {
+		duration, err := parseTimespan(timespan)
+		if err != nil {
+			return fmt.Errorf("invalid timespan: %w", err)
+		}
+		since = time.Now().Add(-duration)
+		fmt.Printf("🔄 Syncing emails from the last %s...\n\n", duration)
 	}
-
-	fmt.Printf("🔄 Syncing emails from the last %s...\n\n", duration)
 
 	// Step 1: Fetch and classify emails
 	fmt.Println("📥 Step 1/4: Fetching and classifying emails...")
-	since := time.Now().Add(-duration)
 	messages, err := client.ListInboxMessagesSince(ctx, since)
 	if err != nil {
 		return fmt.Errorf("failed to fetch inbox messages: %w", err)
@@ -839,7 +963,13 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 		fmt.Printf("   🧪 Archive dry-run: decisions logged to %s (no messages will be moved)\n", archiver.LogPath())
 	}
 
+	tasker, taskFallbackDue, err := newTodoistClient(cfg)
+	if err != nil {
+		fmt.Printf("   ⚠️  Todoist disabled: %v\n", err)
+	}
 	newCount := 0
+	taskCreated := 0
+	taskUpdated := 0
 
 	// Step 2: Process each message
 	fmt.Println("\n📋 Step 2/4: Processing messages...")
@@ -850,8 +980,20 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 
 		if err == nil {
 			// Already exists - re-decide (e.g. an OTP that has since been read)
-			if _, err := archiver.Process(ctx, msg, existingCategory, nil); err != nil {
+			decision, err := archiver.Process(ctx, msg, existingCategory, nil)
+			if err != nil {
 				fmt.Printf("   ⚠️  Archive failed: %v\n", err)
+			}
+			triage := loadStoredTriage(ctx, db.DB(), msg.ID)
+			if tasker != nil && !decision.Archive {
+				status, err := upsertTodoistTask(ctx, cfg, tasker, taskFallbackDue, msg, existingCategory, triage)
+				if err != nil {
+					fmt.Printf("   ⚠️  Todoist failed: %v\n", err)
+				} else if status == "created" {
+					taskCreated++
+				} else if status == "updated" {
+					taskUpdated++
+				}
 			}
 			continue
 		}
@@ -888,8 +1030,19 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 		newCount++
 
 		// Auto-archive if it doesn't need personal attention
-		if _, err := archiver.Process(ctx, msg, result.Category, result.Triage); err != nil {
+		decision, err := archiver.Process(ctx, msg, result.Category, result.Triage)
+		if err != nil {
 			fmt.Printf("   ⚠️  Archive failed: %v\n", err)
+		}
+		if tasker != nil && !decision.Archive {
+			status, err := upsertTodoistTask(ctx, cfg, tasker, taskFallbackDue, msg, result.Category, result.Triage)
+			if err != nil {
+				fmt.Printf("   ⚠️  Todoist failed: %v\n", err)
+			} else if status == "created" {
+				taskCreated++
+			} else if status == "updated" {
+				taskUpdated++
+			}
 		}
 
 		if (i+1)%10 == 0 {
@@ -900,6 +1053,9 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 	fmt.Printf("   ✓ Classified %d new messages\n", newCount)
 	if archiver.Live() {
 		fmt.Printf("   ✓ Archived %d messages\n\n", archiver.Archived)
+	}
+	if tasker != nil {
+		fmt.Printf("   ✓ Todoist tasks: %d created, %d updated\n\n", taskCreated, taskUpdated)
 	}
 
 	// Step 3: Generate summaries (cached for future digests)
@@ -912,7 +1068,7 @@ func syncEmails(ctx context.Context, cfg *Config, client *graph.Client, db *stor
 	}
 
 	// Get all messages in the timespan that need summaries
-	startTime := time.Now().Add(-duration)
+	startTime := since
 	endTime := time.Now()
 
 	rows, err := db.DB().QueryContext(ctx, `
